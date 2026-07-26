@@ -5,6 +5,9 @@
 # python
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+.pytest_cache/
 
 # downloaded model weights (re-downloaded on first use)
 models/

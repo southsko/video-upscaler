@@ -184,6 +184,14 @@ Takeaways:
 
 ---
 
+## Development
+
+```powershell
+pip install -e ".[dev]"     # editable install + pytest; gives an `upscale-video` command
+python -m pytest            # 24 pure-logic tests (no GPU needed): target math, RIFE resample
+                            # frame-counts, scratch keying, encoder args, dedup, output naming
+```
+
 ## Built on
 
 - [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) & the ESRGAN community models (BSD-3)

@@ -124,8 +124,9 @@ lossless dup-frame dedup. All committed & pushed.
 15. ⚪ Compare-with-lanczos toggle.
 
 **Foundation**
-16. 🟡 **pytest** over pure logic (`parse_target`, `_resample`, `_scratch_dir`, `build_video_args`,
-    `unique_output`, dedup). 17. 🟡 `pyproject.toml` + `upscale-video` entry point. 18. ⚪ CI smoke test.
+16. ✅ DONE — `tests/test_engine.py`, 24 pure-logic tests (no GPU). Run `python -m pytest`.
+17. ✅ DONE — `pyproject.toml` + `upscale-video` console entry point (`pip install -e ".[dev]"`).
+18. ⚪ CI smoke test (GitHub Action running pytest + `--dry-run` on push).
 
 ## 10. Conventions
 - House style: single-file engine, colorama `info/warn/err/ok/div`, argparse, collision-aware output.
