@@ -9,12 +9,29 @@ Quality ladder, all riding ONE multi-frame pipe:
 2. **Temporal VSR** (ccrestoration: AnimeSR/BasicVSR/IconVSR/EDVR) — multi-frame, less flicker. ✅ done
    (`--vsr`). The realistic quality ceiling on 24 GB at sane speed.
 3. **Diffusion video restoration** — the true ceiling. **Target model: SeedVR2** (ICLR2026,
-   github.com/IceClear/SeedVR2) — *one-step* diffusion VSR, 3B/7B with FP8/GGUF quant to fit 24 GB.
-   NOT built. Needs a `diffusers`-style backend as a heavy opt-in tier; reuses the same multi-frame
-   window the VSR pipe already established. This is the big future build.
+   github.com/IceClear/SeedVR2, code at github.com/ByteDance-Seed/SeedVR) — *one-step* diffusion VSR,
+   3B/7B with FP8/GGUF quant to fit 24 GB. **Integration path is BUILT (`--external-cmd`)** but
+   SeedVR2 itself is NOT installed/verified here (it can't: needs xformers/flash-attn — no py3.14/
+   Windows wheels — and 24 GB). See below.
 
-The architecture bet that makes this cheap: **the multi-frame window (`_vsr_stream`) is built once** —
-temporal VSR uses it now; the diffusion backend plugs into the same seam later.
+### Tier 3 / SeedVR2 integration — how it actually plugs in
+SeedVR2 can't live in our py3.14 venv (heavy deps). So the design is **orchestration, not in-process**:
+`--external-cmd` runs ANY external video-to-video upscaler **per segment in its own env/GPU**, and our
+tool wraps it with split/resume/concat/audio-mux. The plumbing is built and verified with an ffmpeg
+stand-in (`_run_external_segment` / `_external_args`). To finish on the 24 GB box:
+1. Install SeedVR2 in ITS OWN environment (clone ByteDance-Seed/SeedVR, its deps, download 3B/FP8 weights).
+   Linux strongly preferred (xformers/flash-attn wheels exist there for a supported Python).
+2. Wrap its inference as a video-in/video-out command, then:
+   ```
+   python upscale_video.py "movie.mkv" --target 4k --segment-seconds 60 \
+     --external-cmd "python /opt/SeedVR2/infer_video.py --input {input} --output {output} --res {target} --model 3b-fp8"
+   ```
+   Placeholders: `{input} {output} {width} {height} {target}`. Our tool handles everything around it.
+3. Tune `--segment-seconds` down (e.g. 30–60) since diffusion is slow and you want frequent resume points.
+
+The architecture bet paid off: **the multi-frame window (`_vsr_stream`) AND the external per-segment
+seam are both built** — temporal VSR uses the window now; a diffusion model plugs in via `--external-cmd`
+today (or in-process later via the same `enhance_clip`/`is_temporal` protocol if someone packages it).
 
 ## 1. What this project is
 A free, self-hosted **AI video upscaler**: streams frames `ffmpeg decode → GPU super-resolution →

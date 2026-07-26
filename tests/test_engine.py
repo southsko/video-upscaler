@@ -142,6 +142,16 @@ def test_dedup_reuses_identical():
     assert d.reused == 2
 
 
+# ── external command arg substitution ───────────────────────────────────────
+def test_external_args_paths_with_spaces():
+    subs = {"input": r"C:\my movies\a b.mkv", "output": r"D:\out\up 0.mkv",
+            "width": "3840", "height": "2160", "target": "3840x2160"}
+    args = U._external_args("tool --in {input} --out {output} --res {target}", subs)
+    # {input}/{output} stay single args despite spaces
+    assert args == ["tool", "--in", r"C:\my movies\a b.mkv",
+                    "--out", r"D:\out\up 0.mkv", "--res", "3840x2160"]
+
+
 # ── time formatting ──────────────────────────────────────────────────────────
 def test_fmt():
     assert U._fmt(65) == "1:05"

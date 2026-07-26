@@ -119,6 +119,11 @@ python upscale_video.py clip.mkv --interpolate --fps 60
 # Temporal VSR (multi-frame, less flicker than single-image) — great for anime
 python upscale_video.py clip.mkv --vsr --vsr-model AnimeSR_v2_4x --vsr-window 16
 
+# Orchestrate an external upscaler per segment (its own env/GPU) — e.g. a heavy
+# diffusion model like SeedVR2. We handle split/resume/concat/audio-mux around it.
+python upscale_video.py clip.mkv --target 4k --segment-seconds 60 \
+  --external-cmd "python /opt/SeedVR2/infer.py --input {input} --output {output} --res {target}"
+
 # Compare model speeds on YOUR GPU (run on an idle GPU for accurate numbers)
 python upscale_video.py clip.mkv --benchmark
 

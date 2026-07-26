@@ -926,8 +926,39 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
     return seg_frames
 
 
+def _external_args(cmd_template, subs):
+    """Tokenise a command TEMPLATE then substitute placeholders per token, so a
+    substituted path with spaces stays a single argument."""
+    import shlex
+    out = []
+    for tok in shlex.split(cmd_template, posix=True):
+        for k, v in subs.items():
+            tok = tok.replace("{%s}" % k, v)
+        out.append(tok)
+    return out
+
+
+def _run_external_segment(job, src_seg, out_seg, target, cmd_template):
+    """Run a user-configured external video-to-video upscaler on one segment.
+
+    This is the integration point for heavy models that can't live in our venv
+    (e.g. SeedVR2 diffusion) — they run in THEIR own environment and we just
+    orchestrate (segment, resume, concat, mux) around them. The template may use
+    {input} {output} {width} {height} {target} placeholders."""
+    tw, th = target
+    args = _external_args(cmd_template, {
+        "input": src_seg, "output": out_seg, "width": str(tw),
+        "height": str(th), "target": f"{tw}x{th}"})
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.isfile(out_seg):
+        tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+        raise RuntimeError(f"external command failed (rc={r.returncode}): "
+                           + " | ".join(tail))
+
+
 def run_job(job, upscaler, on_progress=None, interpolator=None):
-    """Full pipeline for one Job. `upscaler` is a ready Upscaler instance;
+    """Full pipeline for one Job. `upscaler` is a ready Upscaler/VSRUpscaler (or
+    None when settings['external_cmd'] drives an external per-segment upscaler);
     `interpolator` is an optional ready Interpolator (RIFE) for fps boost."""
     job.status = "running"
     job.started = time.time()
@@ -941,10 +972,14 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
             fps_out = float(job.settings.get("fps") or 0) or fps_in * 2
             job.total_frames = max(1, round(job.total_frames * fps_out / fps_in))
             job.meta["fps_out"] = round(fps_out, 3)
-        scale = upscaler.scale
-        up_w, up_h = model_output_dims(meta["width"], meta["height"], scale)
         target = parse_target(job.settings.get("target", "4k"))
-        video_args, _label = pick_encoder(job.settings)
+        external = job.settings.get("external_cmd")
+        if external:
+            scale = up_w = up_h = video_args = None
+        else:
+            scale = upscaler.scale
+            up_w, up_h = model_output_dims(meta["width"], meta["height"], scale)
+            video_args, _label = pick_encoder(job.settings)
 
         scratch = _scratch_dir(job, job.settings.get("scratch"))
         seg_seconds = job.settings.get("segment_seconds", DEFAULT_SEGMENT_SECONDS)
@@ -974,8 +1009,15 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
                 continue
             if job._cancel.is_set():
                 break
-            _process_segment(job, upscaler, ss, meta, up_w, up_h, target,
-                             video_args, out_seg, on_progress, interpolator)
+            if external:
+                _run_external_segment(job, ss, out_seg, target, external)
+                job.done_frames = min(job.total_frames,
+                                      round(job.total_frames * (i + 1) / len(src_segs)))
+                if on_progress:
+                    on_progress(job)
+            else:
+                _process_segment(job, upscaler, ss, meta, up_w, up_h, target,
+                                 video_args, out_seg, on_progress, interpolator)
             if job._cancel.is_set():
                 break
 
@@ -996,11 +1038,14 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
 
         dst = unique_output(job.dst) if not job.settings.get("overwrite") else job.dst
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-        metatag = (f"Upscaled with {upscaler.name} to {target[0]}x{target[1]} "
-                   f"(x{scale} model + lanczos)")
-        if interpolator:
-            metatag += (f"; frame-interpolated to {job.meta.get('fps_out')}fps "
-                        f"with {interpolator.name}")
+        if external:
+            metatag = f"Upscaled with external command to {target[0]}x{target[1]}"
+        else:
+            metatag = (f"Upscaled with {upscaler.name} to {target[0]}x{target[1]} "
+                       f"(x{scale} model + lanczos)")
+            if interpolator:
+                metatag += (f"; frame-interpolated to {job.meta.get('fps_out')}fps "
+                            f"with {interpolator.name}")
         _run(build_mux_cmd(body, job.src, dst,
                            metatag, job.settings.get("container", "mkv")))
         job.dst = dst
@@ -1370,7 +1415,7 @@ def _settings_from_args(a):
         "overwrite": a.overwrite, "pad": not a.no_pad, "pad_color": a.pad_color,
         "tile": a.tile, "tile_pad": a.tile_pad, "fp16": not a.fp32, "gpu": a.gpu,
         "denoise": a.denoise, "weights_dir": a.weights_dir,
-        "dedup": not a.no_dedup,
+        "dedup": not a.no_dedup, "external_cmd": a.external_cmd,
         "segment": not a.no_segment, "segment_seconds": a.segment_seconds,
         "resume": not a.no_resume, "keep_segments": a.keep_segments,
         "scratch": a.scratch, "queue_size": a.queue_size,
@@ -1428,6 +1473,12 @@ def build_parser():
                    help="AnimeSR_v2_4x (anime) | BasicVSR/IconVSR/EDVR (general)")
     g.add_argument("--vsr-window", type=int, default=16,
                    help="frames per VSR window (more = better temporal, more VRAM)")
+
+    g = p.add_argument_group("external / diffusion (SeedVR2 etc.)")
+    g.add_argument("--external-cmd", default=None, metavar="TEMPLATE",
+                   help="orchestrate an external video-to-video upscaler per segment "
+                        "(its own env/GPU). Placeholders: {input} {output} {width} {height} {target}. "
+                        "This is how you plug in a heavy diffusion model like SeedVR2.")
 
     g = p.add_argument_group("encode")
     g.add_argument("--codec", default=ENC_DEFAULTS["codec"],
@@ -1502,6 +1553,25 @@ def run_cli(args):
         for f in files:
             plan_and_print(f, settings)
         return 0
+
+    # external orchestration path (diffusion/SeedVR2 etc.) — no in-process model
+    if args.external_cmd:
+        info(f"External upscaler (per-segment): {args.external_cmd[:70]}"
+             f"{'...' if len(args.external_cmd) > 70 else ''}")
+        n_ok = n_fail = 0
+        for i, src in enumerate(files, 1):
+            job = Job(src, settings)
+            info(f"[{i}/{len(files)}] {os.path.basename(src)} → {os.path.basename(job.dst)}")
+            run_job(job, None, on_progress=_cli_progress)
+            sys.stdout.write("\r" + " " * 110 + "\r")
+            if job.status == "done":
+                n_ok += 1
+                ok(f"[{i}/{len(files)}] {os.path.basename(job.dst)}")
+            else:
+                n_fail += 1
+                err(f"[{i}/{len(files)}] {job.status}: {job.error}")
+        div(); ok(f"{n_ok} done, {n_fail} failed")
+        return 0 if n_fail == 0 else 1
 
     info("Detecting encoder ...")
     _va, label = pick_encoder(settings)
