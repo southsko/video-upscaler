@@ -1,0 +1,16 @@
+# virtual env
+.venv/
+.venv-*/
+
+# python
+__pycache__/
+*.pyc
+
+# downloaded model weights (re-downloaded on first use)
+models/
+*.pth
+*.safetensors
+
+# runtime state / scratch
+jobs.json
+*.part

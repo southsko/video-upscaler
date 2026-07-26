@@ -1,0 +1,175 @@
+# 🔍 Video Upscaler
+
+> Free, self-hosted **AI video upscaling** with open models and a polished local web UI.
+
+![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-ee4c2c)
+![ffmpeg](https://img.shields.io/badge/ffmpeg-NVENC-007808)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
+
+Frames stream straight through the GPU — `decode → GPU → encode` with **no PNG files ever hitting
+disk** — using open super-resolution models (Real-ESRGAN and any
+[`spandrel`](https://github.com/chaiNNer-org/spandrel)-loadable checkpoint: ESRGAN, SwinIR, HAT, DAT,
+SPAN, …, or a HuggingFace id). Optional RIFE frame interpolation. Drive it from the command line or a
+local web dashboard.
+
+Companion to [`pi_convert.py`](https://github.com/southsko/pi-tv) (downscaler) and
+[`drone-footage-merger`](https://github.com/southsko/drone-footage-merger) (joiner) — same house style.
+
+---
+
+## Highlights
+
+| | |
+|---|---|
+| 🧠 **Any model** | Real-ESRGAN, SwinIR, HAT, DAT, SPAN, Compact, … from a builtin name, a local `.pth`/`.safetensors`, or a HuggingFace / OpenModelDB id |
+| ⚡ **Efficient** | GPU-resident raw-video pipe, threaded to keep the GPU saturated — **no intermediate PNGs on disk** |
+| ⏯️ **Robust resume** | Segmented processing; an interrupted run skips the segments it already finished, even across restarts |
+| 🎞️ **Frame interpolation** | Optional RIFE fps boost at *any* ratio (24/25/30 → 48/60…), via fractional timesteps |
+| 📺 **4K by default** | Any custom `WxH`; tuned NVENC encode (H.264 / HEVC); auto tile-sizing from free VRAM |
+| 🖥️ **Polished web UI** | Server-side file browser, live queue with WebSocket progress, before/after comparison slider, persistent queue |
+| 🔌 **Headless friendly** | CLI and web UI share one engine; batch whole folders over SSH |
+
+---
+
+## How it works
+
+Per file, everything streams through memory — the only thing on disk is the finished output (and,
+optionally, keyframe-aligned source segments so runs can resume):
+
+```
+ffprobe ─► {res, fps, duration, audio/subs}
+   │  split losslessly into resumable segments (keyframe-aligned)
+   ▼
+ ffmpeg DECODE ──rgb24 rawvideo──►┐
+                                  │  threaded pipeline (GPU stays saturated)
+        reader → [RIFE interpolate?] → Real-ESRGAN upscale (tiled, fp16) → writer
+                                  │
+                                  └──rgb24 rawvideo──► ffmpeg ENCODE
+                                       (lanczos scale+pad to exact target, NVENC)
+   │  concat segments (-c copy)
+   ▼
+ mux original audio + subtitles + metadata ─► <name>_upscaled.mkv
+```
+
+Real-ESRGAN is native ×2/×4; the exact target size is reached with a final lanczos `scale`+`pad`,
+so any output resolution works.
+
+---
+
+## Setup
+
+**Verified** on Windows 11, **Python 3.14.6**, **torch 2.11.0+cu128**, spandrel 0.4.2, ccvfi 0.0.3,
+opencv 5.0, ffmpeg 8.1, NVIDIA RTX 3080 (driver 595.79). The whole stack has Python 3.14 wheels — no
+separate Python needed.
+
+### Quick setup
+
+```powershell
+python upscale_video.py --setup       # creates .venv, installs CUDA torch + everything
+```
+
+Then run through the venv, e.g. `.\.venv\Scripts\python.exe upscale_video.py ...`.
+
+### Manual setup (equivalent)
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+
+# 1) PyTorch CUDA build FIRST (the default `pip install torch` is CPU-only!)
+#    cu128 matches modern NVIDIA drivers; older drivers can use cu126/cu124.
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# 2) everything else
+pip install -r requirements.txt
+
+# 3) verify the GPU is visible
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Also needs **`ffmpeg`** + **`ffprobe`** on `PATH` (a full build, for NVENC).
+
+**Gotchas**
+- If `torch.cuda.is_available()` is `False`, you installed the CPU wheel — reinstall from the cu128 index.
+- Pick the CUDA index for your driver: newest → `cu128`, then `cu126`, `cu124`. Very new Python
+  versions only appear on the newer indexes.
+- Avoid the Windows **Store** Python (under `WindowsApps`) — sandboxed and flaky for native packages.
+
+---
+
+## Usage
+
+### CLI
+
+```powershell
+# Single file, 480p cartoon → 4K with the anime-video model (default)
+python upscale_video.py "D:\show\s01e02.mp4"
+
+# A whole folder (recursive), to 1080p, HEVC
+python upscale_video.py "D:\show\Season 1" --target 1080p --codec hevc_nvenc
+
+# A specific HuggingFace / community model, exact custom size
+python upscale_video.py clip.mkv --model 4x-UltraSharp --target 2560x1440
+
+# Upscale AND boost frame rate to 60fps (RIFE interpolation)
+python upscale_video.py clip.mkv --interpolate --fps 60
+
+# See exactly what it would run, without running it
+python upscale_video.py clip.mkv --dry-run
+```
+
+`--list-models` prints the builtin shortlist. `python upscale_video.py --help` shows the full option
+surface (target, model, tile/fp16/gpu, codec/qp/preset, segmentation/resume, interpolation, …).
+
+### Web UI
+
+```powershell
+python upscale_video.py --serve --open
+```
+
+Opens a local dashboard (default `http://127.0.0.1:8848`): browse the server's drives, queue files,
+watch live per-job progress, and use the before/after slider to tune settings **before** committing a
+long run.
+
+> **🔒 Security:** the UI can read the server's filesystem, so it binds to **localhost only** by
+> default. To reach it from another device use `--host 0.0.0.0`, which prints a required access
+> **token** — only expose it on a trusted LAN.
+
+---
+
+## Notes & caveats
+
+- **GPU / tiling:** `--tile 0` (default) auto-sizes the tile from free VRAM (512 on a 10 GB card);
+  set `--tile N` to override. Ampere cards decode but **can't encode AV1** — `av1_nvenc` needs an
+  RTX 40-series; default is `h264_nvenc` (or `hevc_nvenc`).
+- **Resume across restarts:** the scratch dir is keyed by a hash of source + key settings (not the
+  run's job id), so re-running an interrupted job skips finished segments.
+- **Persistent web queue:** jobs are saved to `jobs.json` and restored on restart — unfinished jobs
+  re-queue (and resume), done/failed stay as history until you *Clear finished*; jobs whose source
+  has moved are dropped.
+- **Models** download on first use (with a confirmation) into `--weights-dir` and are cached.
+- **Interpolation** (`--interpolate`) uses RIFE via [`ccvfi`](https://pypi.org/project/ccvfi/)
+  (weights auto-download). `--interp-order pre` (default) interpolates at source res then upscales
+  (fast); `post` upscales then interpolates at target res (slower, sharper motion). It runs
+  independently per segment, so one bridging frame is dropped at each segment boundary (negligible).
+- Uses **spandrel** instead of `realesrgan`/`basicsr` — broader model support, and it sidesteps the
+  well-known `basicsr` crash importing the removed `torchvision.transforms.functional_tensor`.
+
+---
+
+## Built on
+
+- [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) & the ESRGAN community models (BSD-3)
+- [spandrel](https://github.com/chaiNNer-org/spandrel) — architecture-detecting model loader
+- [ccvfi](https://github.com/EutropicAI/ccvfi) / [RIFE](https://github.com/hzwer/Practical-RIFE) — frame interpolation
+- [FFmpeg](https://ffmpeg.org/) — decode, NVENC encode, mux
+- [FastAPI](https://fastapi.tiangolo.com/) + [PyTorch](https://pytorch.org/)
+
+---
+
+## License
+
+The tool itself is provided as-is for personal use. **Individual models carry their own licenses**
+(many permissive, some non-commercial) — check the terms of any model you download.

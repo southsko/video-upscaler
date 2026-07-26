@@ -1,0 +1,31 @@
+# Video Upscaler dependencies
+#
+# IMPORTANT: torch must be the CUDA build, not the default CPU wheel from PyPI.
+# Install torch/torchvision separately from the CUDA wheel index FIRST, e.g.:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# then:  pip install -r requirements.txt
+#
+# See README.md for the full setup (and the Python 3.14 vs 3.12 note).
+
+# --- core inference ---
+spandrel>=0.4.1          # loads ESRGAN/Real-ESRGAN/SwinIR/HAT/DAT/SPAN/... checkpoints by arch auto-detect
+ccvfi>=0.0.3             # RIFE frame interpolation (auto-downloads weights)
+huggingface_hub>=0.24    # download models by HF repo id
+numpy>=1.24
+opencv-python>=4.9       # frame <-> ndarray, preview JPEG encode
+pillow>=10.0             # preview image encode
+
+# --- web UI ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9  # form posts
+websockets>=12.0         # ws transport for uvicorn[standard] (usually pulled in)
+
+# --- nice-to-have terminal polish (optional) ---
+colorama>=0.4.6 ; platform_system == "Windows"
+windows-curses>=2.3 ; platform_system == "Windows"
+
+# torch / torchvision are installed via the CUDA index (see header) — not pinned here
+# so this file stays index-agnostic.

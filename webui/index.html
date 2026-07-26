@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video Upscaler</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%8D%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">🔍</div>
+      <div>
+        <h1>Video Upscaler</h1>
+        <div class="sub">Open-model AI upscaling · streaming GPU pipeline</div>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="chips" id="chips">
+      <span class="chip" id="chip-gpu"><span class="dot"></span> GPU …</span>
+      <span class="chip" id="chip-enc"><span class="dot"></span> encoder …</span>
+      <span class="chip" id="chip-torch"><span class="dot"></span> torch …</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- QUEUE -->
+    <section class="panel">
+      <div class="head">
+        <h2>QUEUE</h2>
+        <span class="count" id="queue-count"></span>
+        <div class="spacer"></div>
+        <button class="btn ghost sm" id="clear-btn" title="Remove finished/failed jobs">Clear finished</button>
+        <button class="btn primary sm" id="add-btn">＋ Add videos</button>
+      </div>
+      <div class="body">
+        <div class="queue" id="queue">
+          <div class="empty" id="queue-empty">
+            <div class="big">🎬</div>
+            <div>No videos queued yet.</div>
+            <div style="margin-top:6px;color:var(--text-faint)">Click <b>Add videos</b> to browse your drives.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: settings + preview -->
+    <div style="display:flex;flex-direction:column;gap:20px;">
+      <section class="panel">
+        <div class="head"><h2>SETTINGS</h2><span class="count">applied to new jobs</span></div>
+        <div class="body" id="settings">
+          <div class="grouphead">Output</div>
+          <div class="field">
+            <label>Target resolution</label>
+            <div class="seg" id="target-seg">
+              <button data-v="4k" class="active">4K</button>
+              <button data-v="1440p">1440p</button>
+              <button data-v="1080p">1080p</button>
+              <button data-v="custom">Custom</button>
+            </div>
+            <input type="text" id="target-custom" placeholder="e.g. 2560x1440" style="display:none;margin-top:8px">
+          </div>
+          <div class="row2">
+            <div class="field">
+              <label>Container</label>
+              <select id="container"><option>mkv</option><option>mp4</option></select>
+            </div>
+            <div class="field">
+              <label>Codec</label>
+              <select id="codec">
+                <option value="h264_nvenc">H.264 (NVENC)</option>
+                <option value="hevc_nvenc">HEVC (NVENC)</option>
+                <option value="av1_nvenc">AV1 (NVENC)</option>
+                <option value="libx264">x264 (CPU)</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label>Output folder <span class="hint">— blank = next to each source</span></label>
+            <input type="text" id="output" placeholder="(same folder as source)">
+          </div>
+
+          <div class="grouphead">Model</div>
+          <div class="field">
+            <label>Upscaling model</label>
+            <select id="model"></select>
+            <div class="hint" id="model-note"></div>
+          </div>
+          <div class="field">
+            <label>…or a HuggingFace id / local path</label>
+            <input type="text" id="model-custom" placeholder="user/repo  or  D:\models\4x-UltraSharp.pth">
+          </div>
+
+          <div class="grouphead">Quality / speed</div>
+          <div class="row2">
+            <div class="field">
+              <label>Quality (QP) <span class="hint">lower = better</span></label>
+              <input type="number" id="qp" value="18" min="1" max="51">
+            </div>
+            <div class="field">
+              <label>Tile size <span class="hint">0 = auto (VRAM)</span></label>
+              <input type="number" id="tile" value="0" step="64" min="0">
+            </div>
+          </div>
+          <label class="switch"><input type="checkbox" id="fp16" checked><span class="track"></span> fp16 (faster, less VRAM)</label>
+          <label class="switch"><input type="checkbox" id="interpolate"><span class="track"></span> Interpolate frame rate (RIFE)</label>
+          <div class="field" id="fps-field" style="display:none">
+            <label>Target fps</label>
+            <input type="number" id="fps" value="60" step="1">
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="head"><h2>BEFORE / AFTER PREVIEW</h2></div>
+        <div class="preview-wrap">
+          <div class="compare" id="compare">
+            <div class="placeholder" id="preview-ph">Pick a file (＋ Add or the button below) and hit <b>Preview</b> to see one upscaled frame before committing a long run.</div>
+            <img id="img-before" style="display:none">
+            <div class="after-wrap" id="after-wrap" style="display:none"><img id="img-after"></div>
+            <div class="divider" id="divider" style="display:none"></div>
+            <div class="knob" id="knob" style="display:none">⇔</div>
+            <span class="lbl b" id="lbl-b" style="display:none">SOURCE</span>
+            <span class="lbl a" id="lbl-a" style="display:none">UPSCALED</span>
+          </div>
+          <div class="preview-ctl">
+            <div class="field" style="flex:2">
+              <label>File</label>
+              <input type="text" id="preview-file" placeholder="(pick a file)" readonly>
+            </div>
+            <div class="field">
+              <label>Time (s)</label>
+              <input type="number" id="preview-ts" value="2" min="0" step="1">
+            </div>
+            <button class="btn primary" id="preview-btn">Preview</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<!-- FILE BROWSER MODAL -->
+<div class="overlay" id="overlay"></div>
+<div class="modal" id="browser-modal">
+  <div class="mhead">
+    <h3>📁 Choose videos</h3>
+    <div class="spacer"></div>
+    <button class="btn ghost sm" id="browser-close">Close</button>
+  </div>
+  <div class="breadcrumb" id="breadcrumb"></div>
+  <div class="browser" id="browser"></div>
+  <div class="mfoot">
+    <span class="n" id="sel-count">0 selected</span>
+    <div class="spacer"></div>
+    <button class="btn ghost" id="add-folder-btn" title="Add every video under this folder (recursive)">Add whole folder</button>
+    <button class="btn primary" id="add-selected-btn">Add selected</button>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

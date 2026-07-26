@@ -1,0 +1,1325 @@
+#!/usr/bin/env python3
+"""Video Upscaler — a free, open-model AI video upscaler.
+
+Efficient by design: frames stream
+``ffmpeg decode -> GPU inference -> ffmpeg NVENC`` with NO PNG files hitting
+disk. Upscaling is done by open super-resolution models (Real-ESRGAN and any
+other checkpoint spandrel can load: ESRGAN, SwinIR, HAT, DAT, SPAN, ...),
+loaded from a builtin name, a local .pth/.safetensors, or a HuggingFace id.
+
+Companion to pi_convert.py (downscaler) and merge_videos.py (joiner) — same
+house style (colorama logging, tiered NVENC detection, collision-aware output,
+folder recursion + interactive browser).
+
+    python upscale_video.py "D:\\show\\s01e02.mp4"            # 480p -> 4K
+    python upscale_video.py "D:\\show\\Season 1" --target 1080p --codec hevc_nvenc
+    python upscale_video.py clip.mkv --model 4x-UltraSharp --dry-run
+    python upscale_video.py --serve --open                    # polished web UI
+
+Heavy deps (torch, spandrel, numpy, opencv) are imported lazily, so --help,
+--dry-run, --list-models, probing and encoder detection work without them.
+See README.md for setup (venv + CUDA torch; note the Python 3.14/3.12 caveat).
+"""
+import argparse
+import glob
+import hashlib
+import json
+import math
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+
+# Windows consoles / redirected pipes often default to cp1252, which can't encode
+# the arrows/box characters we print — force UTF-8 so logging never crashes.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+# ── colorama (optional, nicer colours) ────────────────────────────────────────
+try:
+    from colorama import init as _color_init, Fore, Back, Style
+    _color_init(autoreset=True)
+    HAS_COLOR = True
+except ImportError:
+    HAS_COLOR = False
+
+    class _D:
+        def __getattr__(self, _):
+            return ''
+    Fore = Back = Style = _D()
+
+
+def info(m):  print(f"{Fore.CYAN}{Style.BRIGHT}[INFO]{Style.RESET_ALL}  {m}")
+def warn(m):  print(f"{Fore.YELLOW}{Style.BRIGHT}[WARN]{Style.RESET_ALL}  {m}")
+def err(m):   print(f"{Fore.RED}{Style.BRIGHT}[ERR] {Style.RESET_ALL}  {m}")
+def ok(m):    print(f"{Fore.GREEN}{Style.BRIGHT}[OK]  {Style.RESET_ALL}  {m}")
+def div():    print(f"{Fore.BLUE}{Style.BRIGHT}{'-' * 62}{Style.RESET_ALL}")
+
+
+# ── constants / config (env-overridable) ──────────────────────────────────────
+VIDEO_EXTENSIONS = ['*.mp4', '*.mov', '*.avi', '*.mkv', '*.m4v', '*.webm',
+                    '*.flv', '*.wmv', '*.ts', '*.mpg', '*.mpeg', '*.m2ts',
+                    '*.MP4', '*.MOV', '*.AVI', '*.MKV']
+_VIDEO_EXTS = {os.path.splitext(p)[1].lower() for p in VIDEO_EXTENSIONS}
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_WEIGHTS_DIR = os.environ.get("UPSCALE_WEIGHTS_DIR", os.path.join(HERE, "models"))
+
+TARGET_PRESETS = {
+    "4k": (3840, 2160), "2160p": (3840, 2160), "uhd": (3840, 2160),
+    "1440p": (2560, 1440), "2k": (2560, 1440),
+    "1080p": (1920, 1080), "fhd": (1920, 1080),
+    "720p": (1280, 720),
+}
+
+# Builtin models: name -> (download url, native scale, note). Anything spandrel
+# can load also works via a local path or a HuggingFace id, so this is just a
+# curated shortcut list (printed by --list-models).
+BUILTIN_MODELS = {
+    "realesr-animevideov3": (
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth",
+        4, "Anime/cartoon VIDEO — fast, great for animation (default)"),
+    "realesrgan-x4plus": (
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        4, "General / live-action, x4"),
+    "realesrgan-x4plus-anime": (
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+        4, "Anime stills, x4 (lighter 6-block net)"),
+    "realesr-general-x4v3": (
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+        4, "General purpose, x4, supports denoise blend"),
+}
+DEFAULT_MODEL = os.environ.get("UPSCALE_MODEL", "realesr-animevideov3")
+
+# High-quality NVENC defaults (constqp, spatial AQ, p7/hq).
+ENC_DEFAULTS = {
+    "codec": "h264_nvenc", "qp": "18", "preset": "p7", "tune": "hq",
+    "pix_fmt": "yuv420p", "rc_lookahead": "20", "aq_strength": "15",
+    "gop": "30", "bf": "0",
+}
+
+DEFAULT_PORT = int(os.environ.get("UPSCALE_PORT", "8848"))
+DEFAULT_SEGMENT_SECONDS = int(os.environ.get("UPSCALE_SEGMENT_SECONDS", "300"))
+
+
+# ── small utils ───────────────────────────────────────────────────────────────
+def _fmt(secs):
+    secs = int(max(0, secs))
+    if secs >= 3600:
+        return "%d:%02d:%02d" % (secs // 3600, (secs % 3600) // 60, secs % 60)
+    return "%d:%02d" % (secs // 60, secs % 60)
+
+
+def _bar(frac, width=22):
+    frac = max(0.0, min(1.0, frac))
+    fill = int(frac * width)
+    return '[' + '#' * fill + '-' * (width - fill) + ']'
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+
+
+def _run(cmd, timeout=None):
+    """Run, return (returncode, stdout, stderr) as text."""
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
+
+
+def _quote(cmd):
+    """Render an argv list as a copy-pasteable command line (for --dry-run)."""
+    out = []
+    for a in cmd:
+        a = str(a)
+        out.append(f'"{a}"' if (' ' in a or ':' in a[2:] or ',' in a) else a)
+    return " ".join(out)
+
+
+# ── ffprobe metadata ──────────────────────────────────────────────────────────
+def probe(path):
+    """Return a dict of stream/format info, or raise RuntimeError."""
+    rc, out, errtxt = _run([
+        'ffprobe', '-v', 'quiet', '-print_format', 'json',
+        '-show_format', '-show_streams', path])
+    if rc != 0:
+        raise RuntimeError(f"ffprobe failed for {path}: {errtxt.strip()[:200]}")
+    data = json.loads(out)
+    v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+    if v is None:
+        raise RuntimeError(f"No video stream in {path}")
+    has_audio = any(s.get("codec_type") == "audio" for s in data["streams"])
+    has_subs = any(s.get("codec_type") == "subtitle" for s in data["streams"])
+
+    # frame rate can be "30000/1001"
+    def _rat(s, default=0.0):
+        try:
+            if s and "/" in s:
+                a, b = s.split("/")
+                return float(a) / float(b) if float(b) else default
+            return float(s)
+        except (ValueError, ZeroDivisionError, TypeError):
+            return default
+
+    fps = _rat(v.get("avg_frame_rate")) or _rat(v.get("r_frame_rate")) or 0.0
+    dur = 0.0
+    for src in (v.get("duration"), data.get("format", {}).get("duration")):
+        try:
+            dur = float(src)
+            if dur > 0:
+                break
+        except (TypeError, ValueError):
+            continue
+    nb = v.get("nb_frames")
+    try:
+        nb_frames = int(nb)
+    except (TypeError, ValueError):
+        nb_frames = int(round(fps * dur)) if (fps and dur) else 0
+    return {
+        "path": path,
+        "width": int(v.get("width", 0)),
+        "height": int(v.get("height", 0)),
+        "fps": fps,
+        "duration": dur,
+        "nb_frames": nb_frames,
+        "pix_fmt": v.get("pix_fmt", "yuv420p"),
+        "vcodec": v.get("codec_name", "?"),
+        "has_audio": has_audio,
+        "has_subs": has_subs,
+    }
+
+
+# ── target / scale math ───────────────────────────────────────────────────────
+def parse_target(spec):
+    """'4k' | '1080p' | '3840x2160' -> (w, h)."""
+    if spec is None:
+        return TARGET_PRESETS["4k"]
+    key = spec.strip().lower()
+    if key in TARGET_PRESETS:
+        return TARGET_PRESETS[key]
+    for sep in ("x", ":", "X"):
+        if sep in key:
+            a, b = key.split(sep, 1)
+            return int(a), int(b)
+    raise ValueError(f"Unrecognised target '{spec}' (try 4k, 1080p, or WxH)")
+
+
+def model_output_dims(src_w, src_h, scale):
+    return src_w * scale, src_h * scale
+
+
+# ── model layer (lazy torch/spandrel) ─────────────────────────────────────────
+def resolve_model(spec, weights_dir=DEFAULT_WEIGHTS_DIR, assume_yes=False,
+                  confirm=None):
+    """Resolve a --model spec to a local checkpoint path, downloading if needed.
+
+    spec may be: a builtin name, an existing local file, or a HuggingFace id
+    ('repo/id' or 'repo/id:filename.safetensors').
+    confirm(msg)->bool is called before any download (defaults to a CLI prompt).
+    """
+    # 1) existing local file
+    if os.path.isfile(spec):
+        return os.path.abspath(spec)
+
+    os.makedirs(weights_dir, exist_ok=True)
+
+    # 2) builtin name
+    if spec in BUILTIN_MODELS:
+        url, _scale, _note = BUILTIN_MODELS[spec]
+        fname = os.path.basename(url)
+        dest = os.path.join(weights_dir, fname)
+        if os.path.isfile(dest):
+            return dest
+        if not _ask_download(f"model '{spec}' ({fname})", url, assume_yes, confirm):
+            raise RuntimeError(f"Download of model '{spec}' declined.")
+        _download(url, dest)
+        return dest
+
+    # 3) HuggingFace id (optionally repo:file)
+    if "/" in spec:
+        repo, _, filename = spec.partition(":")
+        try:
+            from huggingface_hub import hf_hub_download, list_repo_files
+        except ImportError:
+            raise RuntimeError("huggingface_hub not installed — pip install huggingface_hub")
+        if not filename:
+            files = [f for f in list_repo_files(repo)
+                     if f.lower().endswith((".safetensors", ".pth", ".pt", ".ckpt"))]
+            if not files:
+                raise RuntimeError(f"No model weights found in HF repo '{repo}'")
+            filename = sorted(files, key=len)[0]
+        if not _ask_download(f"HF model '{repo}/{filename}'", f"hf://{repo}/{filename}",
+                             assume_yes, confirm):
+            raise RuntimeError(f"Download of HF model '{spec}' declined.")
+        return hf_hub_download(repo_id=repo, filename=filename, cache_dir=weights_dir)
+
+    raise RuntimeError(
+        f"Unknown model '{spec}'. Use a builtin (--list-models), a local file, "
+        f"or a HuggingFace id like 'user/repo' or 'user/repo:file.safetensors'.")
+
+
+def _ask_download(what, url, assume_yes, confirm):
+    if assume_yes:
+        return True
+    if confirm is not None:
+        return confirm(f"Download {what} from {url}?")
+    try:
+        resp = input(f"{Fore.YELLOW}Download {what}?{Style.RESET_ALL}\n  {url}\n  [Y/n] ")
+        return resp.strip().lower() in ("", "y", "yes")
+    except EOFError:
+        return False
+
+
+def _download(url, dest):
+    info(f"Downloading {os.path.basename(dest)} ...")
+    tmp = dest + ".part"
+    with urllib.request.urlopen(url) as r:
+        total = int(r.headers.get("Content-Length", 0))
+        got = 0
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if total:
+                    frac = got / total
+                    sys.stdout.write(f"\r  {_bar(frac)} {int(frac*100):3d}%  "
+                                     f"{_human_size(got)}/{_human_size(total)}")
+                    sys.stdout.flush()
+    sys.stdout.write("\r" + " " * 60 + "\r")
+    os.replace(tmp, dest)
+    ok(f"Saved {dest}")
+
+
+class Upscaler:
+    """Loads a spandrel model and upscales RGB uint8 frames with tiling."""
+
+    def __init__(self, model_path, gpu=0, fp16=True, tile=512, tile_pad=16,
+                 denoise=None):
+        import torch
+        from spandrel import ModelLoader, ImageModelDescriptor
+        self.torch = torch
+        self.device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
+        if self.device.type != "cuda":
+            warn("CUDA not available — running on CPU (very slow). Check the "
+                 "torch install (needs the CUDA wheel).")
+        desc = ModelLoader(device=self.device).load_from_file(model_path)
+        if not isinstance(desc, ImageModelDescriptor):
+            raise RuntimeError(f"{os.path.basename(model_path)} is not an image "
+                               f"super-resolution model spandrel can drive.")
+        desc.to(self.device).eval()
+        self.fp16 = bool(fp16 and desc.supports_half and self.device.type == "cuda")
+        if self.fp16:
+            desc.model.half()
+        self.desc = desc
+        self.scale = desc.scale
+        self.tile_pad = int(tile_pad)
+        self.tile = int(tile) if int(tile) > 0 else self._auto_tile()
+        self.name = os.path.basename(model_path)
+
+    def _auto_tile(self):
+        """Pick a tile size from free VRAM so 4K frames don't OOM."""
+        try:
+            free, _total = self.torch.cuda.mem_get_info(self.device)
+            gb = free / (1024 ** 3)
+        except Exception:                            # noqa: BLE001 (CPU / no cuda)
+            return 256
+        for thr, t in ((20, 1024), (12, 768), (8, 512), (6, 384), (4, 256)):
+            if gb >= thr:
+                return t
+        return 192
+
+    def _forward(self, t):
+        with self.torch.no_grad():
+            return self.desc(t)
+
+    def _tiled(self, t):
+        torch = self.torch
+        _, c, h, w = t.shape
+        s, tile, pad = self.scale, self.tile, self.tile_pad
+        if tile <= 0 or (h <= tile and w <= tile):
+            return self._forward(t)
+        out = t.new_zeros((1, c, h * s, w * s))
+        for y in range(0, h, tile):
+            for x in range(0, w, tile):
+                ex, ey = min(x + tile, w), min(y + tile, h)
+                px0, py0 = max(x - pad, 0), max(y - pad, 0)
+                px1, py1 = min(ex + pad, w), min(ey + pad, h)
+                tile_out = self._forward(t[:, :, py0:py1, px0:px1])
+                # crop the padded border back off, place into the canvas
+                cy0, cx0 = (y - py0) * s, (x - px0) * s
+                oh, ow = (ey - y) * s, (ex - x) * s
+                out[:, :, y * s:ey * s, x * s:ex * s] = \
+                    tile_out[:, :, cy0:cy0 + oh, cx0:cx0 + ow]
+        return out
+
+    def enhance(self, img):
+        """img: HxWx3 RGB uint8 ndarray -> upscaled HxWx3 RGB uint8 ndarray."""
+        import numpy as np
+        torch = self.torch
+        t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
+        t = t.unsqueeze(0).to(self.device).float().div_(255.0)
+        if self.fp16:
+            t = t.half()
+        out = self._tiled(t)
+        out = out.squeeze(0).permute(1, 2, 0).clamp_(0, 1).mul_(255.0)
+        return out.round().to(torch.uint8).cpu().numpy()
+
+
+# RIFE model names available via ccvfi.ConfigType.
+RIFE_MODELS = ["RIFE_IFNet_v426_heavy", "DRBA_IFNet"]
+DEFAULT_RIFE_MODEL = os.environ.get("UPSCALE_RIFE_MODEL", "RIFE_IFNet_v426_heavy")
+
+
+class Interpolator:
+    """RIFE frame interpolation via ccvfi. interpolate(a, b, t) synthesises a
+    frame at fractional time t in (0,1) between RGB uint8 frames a and b."""
+
+    def __init__(self, device=None, fp16=True, model_name=DEFAULT_RIFE_MODEL,
+                 scale=1.0, weights_dir=DEFAULT_WEIGHTS_DIR):
+        import torch
+        import torch.nn.functional as F
+        from ccvfi import AutoModel, ConfigType
+        self.torch = torch
+        self.F = F
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.fp16 = bool(fp16 and self.device.type == "cuda")
+        cfg = getattr(ConfigType, model_name)
+        os.makedirs(weights_dir, exist_ok=True)
+        self.model = AutoModel.from_pretrained(cfg, device=self.device,
+                                               fp16=self.fp16, model_dir=weights_dir)
+        self.scale = float(scale)
+        self.name = model_name
+
+    def interpolate(self, a_rgb, b_rgb, t):
+        torch, F = self.torch, self.F
+
+        def to_t(rgb):
+            import numpy as np
+            x = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)
+            x = x.unsqueeze(0).to(self.device).float().div_(255.0)
+            return x.half() if self.fp16 else x
+
+        ta, tb = to_t(a_rgb), to_t(b_rgb)
+        _, _, h, w = ta.shape
+        ph, pw = (64 - h % 64) % 64, (64 - w % 64) % 64  # IFNet needs mult-of-64
+        if ph or pw:
+            ta = F.pad(ta, (0, pw, 0, ph), mode="replicate")
+            tb = F.pad(tb, (0, pw, 0, ph), mode="replicate")
+        inp = torch.stack([ta, tb], dim=1)               # (1, 2, C, H, W)
+        with torch.inference_mode():
+            out = self.model.inference(inp, timestep=float(t), scale=self.scale)
+        out = out[:, :, :h, :w].squeeze(0).permute(1, 2, 0).clamp(0, 1)  # non-inplace
+        return (out * 255).round().to(torch.uint8).cpu().numpy()
+
+
+# ── encoder detection (ported/adapted from pi_convert.py) ─────────────────────
+def _encoder_listed(codec):
+    try:
+        rc, out, _ = _run(['ffmpeg', '-hide_banner', '-encoders'], timeout=15)
+        return codec in out
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _encoder_works(vargs):
+    """(ok, last_error_line) from a tiny real test encode."""
+    try:
+        rc, _, errtxt = _run(
+            ['ffmpeg', '-hide_banner', '-f', 'lavfi', '-i',
+             'color=c=black:s=320x240:d=0.3'] + vargs + ['-f', 'null', '-'],
+            timeout=25)
+        if rc == 0:
+            return True, ""
+        lines = [ln for ln in errtxt.splitlines() if ln.strip()]
+        return False, (lines[-1] if lines else "unknown error")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+
+
+def build_video_args(opts):
+    """NVENC/x264 video-encode args from an options dict (high-quality defaults)."""
+    codec = opts.get("codec", ENC_DEFAULTS["codec"])
+    qp = str(opts.get("qp", ENC_DEFAULTS["qp"]))
+    preset = opts.get("preset", ENC_DEFAULTS["preset"])
+    tune = opts.get("tune", ENC_DEFAULTS["tune"])
+    pix_fmt = opts.get("pix_fmt", ENC_DEFAULTS["pix_fmt"])
+    gop = str(opts.get("gop", ENC_DEFAULTS["gop"]))
+    bf = str(opts.get("bf", ENC_DEFAULTS["bf"]))
+    lookahead = str(opts.get("rc_lookahead", ENC_DEFAULTS["rc_lookahead"]))
+    aq = str(opts.get("aq_strength", ENC_DEFAULTS["aq_strength"]))
+
+    if codec.endswith("_nvenc"):
+        profile = "main10" if pix_fmt in ("p010le", "yuv420p10le") and codec == "hevc_nvenc" \
+            else ("high" if codec == "h264_nvenc" else "main")
+        args = ['-c:v', codec, '-profile:v', profile, '-pix_fmt', pix_fmt,
+                '-preset', preset, '-tune', tune, '-rc', 'constqp', '-qp', qp,
+                '-b:v', '0', '-g', gop, '-bf', bf, '-rc-lookahead', lookahead,
+                '-spatial_aq', '1', '-aq-strength', aq]
+    else:  # libx264 CPU fallback
+        args = ['-c:v', 'libx264', '-profile:v', 'high', '-preset', 'slow',
+                '-crf', qp, '-pix_fmt', pix_fmt, '-g', gop]
+    extra = opts.get("extra_enc")
+    if extra:
+        args += extra.split() if isinstance(extra, str) else list(extra)
+    return args
+
+
+def pick_encoder(opts):
+    """Validate the requested codec; fall back to CPU x264 if it can't run.
+    Returns (video_args, label)."""
+    codec = opts.get("codec", ENC_DEFAULTS["codec"])
+    if codec.endswith("_nvenc"):
+        if not _encoder_listed(codec):
+            warn(f"{codec} not in this ffmpeg build — using CPU libx264.")
+            return build_video_args({**opts, "codec": "libx264"}), "CPU (libx264)"
+        works, why = _encoder_works(build_video_args(opts))
+        if works:
+            return build_video_args(opts), f"GPU ({codec})"
+        warn(f"{codec} present but test failed → {why}")
+        if codec == "av1_nvenc":
+            warn("AV1 encode needs an RTX 40-series+; your GPU likely can't. "
+                 "Try --codec hevc_nvenc.")
+        warn("Falling back to CPU libx264.")
+        return build_video_args({**opts, "codec": "libx264"}), "CPU (libx264)"
+    return build_video_args(opts), codec
+
+
+# ── file discovery (ported) ───────────────────────────────────────────────────
+def _videos_under(folder):
+    """All videos under folder recursively; skips 'sample' files/folders."""
+    found = []
+    for dp, dn, files in os.walk(folder):
+        dn[:] = [d for d in dn if "sample" not in d.lower()]
+        for f in files:
+            if (os.path.splitext(f)[1].lower() in _VIDEO_EXTS
+                    and "sample" not in f.lower()
+                    and not f.startswith(".")
+                    and "_upscaled" not in f.lower()):
+                found.append(os.path.join(dp, f))
+    return sorted(found)
+
+
+def expand_inputs(inputs):
+    """Files/folders -> flat de-duplicated video list (folders recurse)."""
+    files, seen, out = [], set(), []
+    for item in inputs:
+        item = os.path.abspath(os.path.expanduser(item))
+        if os.path.isdir(item):
+            files.extend(_videos_under(item))
+        elif os.path.isfile(item):
+            files.append(item)
+        else:
+            warn(f"Not found: {item}")
+    for f in files:
+        if f.lower() not in seen:
+            seen.add(f.lower())
+            out.append(f)
+    return out
+
+
+def unique_output(path):
+    """Append ' (n)' before the extension until the path is free."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{base} ({n}){ext}"):
+        n += 1
+    return f"{base} ({n}){ext}"
+
+
+def default_output_path(src, settings):
+    d = settings.get("output_dir") or os.path.dirname(src)
+    base = os.path.splitext(os.path.basename(src))[0]
+    suffix = settings.get("suffix", "_upscaled")
+    container = settings.get("container", "mkv")
+    return os.path.join(d, f"{base}{suffix}.{container}")
+
+
+# ── pipeline: commands ────────────────────────────────────────────────────────
+def build_decode_cmd(src, hwaccel=False):
+    """Decode a whole file to rgb24 rawvideo on stdout."""
+    pre = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
+    if hwaccel:
+        pre += ['-hwaccel', 'cuda']
+    return pre + ['-i', src, '-an', '-sn', '-map', '0:v:0',
+                  '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
+
+
+def build_encode_cmd(up_w, up_h, fps, target_w, target_h, out_path, video_args,
+                     pad_color="black", pad=True):
+    """Encode rgb24 rawvideo (from stdin) to a video-only segment, scaling to
+    the exact target with lanczos + pad."""
+    if pad:
+        vf = (f"scale=w={target_w}:h={target_h}:force_original_aspect_ratio=decrease"
+              f":flags=lanczos,pad={target_w}:{target_h}:-1:-1:color={pad_color},setsar=1")
+    else:  # crop-to-fill
+        vf = (f"scale=w={target_w}:h={target_h}:force_original_aspect_ratio=increase"
+              f":flags=lanczos,crop={target_w}:{target_h},setsar=1")
+    return ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+            '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{up_w}x{up_h}',
+            '-r', f'{fps:.6f}', '-i', 'pipe:0',
+            '-vf', vf] + video_args + ['-an', '-sn', out_path]
+
+
+def build_split_cmd(src, seg_seconds, pattern):
+    """Losslessly split the source at keyframes into <=seg_seconds chunks."""
+    return ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', src,
+            '-c', 'copy', '-map', '0:v:0', '-f', 'segment',
+            '-segment_time', str(seg_seconds), '-reset_timestamps', '1',
+            pattern]
+
+
+def build_concat_cmd(list_file, out_path):
+    return ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat',
+            '-safe', '0', '-i', list_file, '-c', 'copy', out_path]
+
+
+def build_mux_cmd(body, original, out_path, meta, container="mkv"):
+    cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+           '-i', body, '-i', original,
+           '-map', '0:v:0', '-map', '1:a?', '-map', '1:s?',
+           '-c', 'copy', '-map_metadata', '1', '-metadata', f'videoai={meta}']
+    if container == "mp4":
+        cmd += ['-movflags', '+faststart']
+    cmd += [out_path]
+    return cmd
+
+
+# ── Job / JobQueue (shared by CLI and web UI) ─────────────────────────────────
+class Job:
+    """A single upscale task + its live status. Both the CLI and the web server
+    drive Jobs through run_job()."""
+    _counter = 0
+    _lock = threading.Lock()
+
+    def __init__(self, src, settings, dst=None):
+        with Job._lock:
+            Job._counter += 1
+            self.id = f"job{Job._counter}"
+        self.src = src
+        self.settings = dict(settings)
+        self.dst = dst or default_output_path(src, settings)
+        self.status = "queued"       # queued|running|paused|done|failed|cancelled
+        self.error = None
+        # progress
+        self.total_frames = 0
+        self.done_frames = 0
+        self.segment = 0
+        self.total_segments = 0
+        self.fps = 0.0
+        self.started = None
+        self.finished = None
+        self.meta = {}
+        # control
+        self._cancel = threading.Event()
+        self._pause = threading.Event()   # set == paused
+
+    # --- control ---
+    def cancel(self):
+        self._cancel.set()
+        self._pause.clear()
+
+    def pause(self):
+        if self.status == "running":
+            self._pause.set()
+            self.status = "paused"
+
+    def resume(self):
+        if self.status == "paused":
+            self._pause.clear()
+            self.status = "running"
+
+    def _wait_if_paused(self):
+        while self._pause.is_set() and not self._cancel.is_set():
+            time.sleep(0.1)
+
+    @property
+    def progress(self):
+        return (self.done_frames / self.total_frames) if self.total_frames else 0.0
+
+    @property
+    def eta(self):
+        if self.fps > 0 and self.total_frames:
+            return (self.total_frames - self.done_frames) / self.fps
+        return None
+
+    def to_dict(self):
+        return {
+            "id": self.id, "src": self.src, "dst": self.dst,
+            "name": os.path.basename(self.src),
+            "status": self.status, "error": self.error,
+            "progress": round(self.progress, 4),
+            "done_frames": self.done_frames, "total_frames": self.total_frames,
+            "segment": self.segment, "total_segments": self.total_segments,
+            "fps": round(self.fps, 1), "eta": self.eta,
+            "settings": self.settings, "meta": self.meta,
+        }
+
+
+def _scratch_dir(job, base=None):
+    """Stable per-(source, key-settings) scratch path — NOT keyed by job.id, so
+    resume works across restarts and new job ids."""
+    base = base or tempfile.gettempdir()
+    key = "|".join(str(x) for x in (
+        os.path.abspath(job.src), job.settings.get("target"),
+        job.settings.get("model"), job.settings.get("codec"),
+        job.settings.get("interpolate"), job.settings.get("fps")))
+    h = hashlib.md5(key.encode("utf-8")).hexdigest()[:10]
+    name = os.path.splitext(os.path.basename(job.src))[0][:40]
+    d = os.path.join(base, "upscale_scratch", f"{name}_{h}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _resample(frames, fps_in, fps_out, interp):
+    """Yield frames at fps_out from a source stream at fps_in, generating the
+    in-between frames with interp(a, b, frac) where frac in (0,1). Handles any
+    ratio via fractional timesteps (e.g. 24->60), not just integer multiples."""
+    it = iter(frames)
+    a = next(it, None)
+    if a is None:
+        return
+    step = fps_in / fps_out
+    i = 0                       # source index of `a`
+    j = 0                       # output index
+    b = next(it, None)
+    while b is not None:
+        while j * step < i + 1 - 1e-9:
+            frac = j * step - i
+            yield a if frac < 1e-3 else interp(a, b, frac)
+            j += 1
+        a = b
+        i += 1
+        b = next(it, None)
+    while j * step <= i + 1e-9:  # tail: hold the final frame
+        yield a
+        j += 1
+
+
+def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
+                     video_args, out_seg, on_progress, interpolator=None):
+    """Stream one source-segment file: decode -> (interpolate) -> GPU upscale ->
+    encode. Threaded so decode-read and encode-write overlap GPU inference."""
+    import numpy as np
+    src_w, src_h = info_meta["width"], info_meta["height"]
+    frame_bytes = src_w * src_h * 3
+    fps_in = info_meta["fps"] or 30.0
+    interpolating = bool(interpolator)
+    fps_out = (float(job.settings.get("fps") or 0) or fps_in * 2) if interpolating else fps_in
+    order = job.settings.get("interp_order", "pre")
+    tw, th = target
+    pad = job.settings.get("pad", True)
+    pad_color = job.settings.get("pad_color", "black")
+
+    dec = subprocess.Popen(build_decode_cmd(src_seg), stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL)
+    enc = subprocess.Popen(
+        build_encode_cmd(up_w, up_h, fps_out, tw, th, out_seg, video_args,
+                         pad_color=pad_color, pad=pad),
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    in_q = queue.Queue(maxsize=job.settings.get("queue_size", 6))
+    out_q = queue.Queue(maxsize=job.settings.get("queue_size", 6))
+    err_box = {}
+
+    def reader():
+        try:
+            while True:
+                buf = dec.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                # .copy() -> writable array (torch.from_numpy dislikes read-only)
+                in_q.put(np.frombuffer(buf, np.uint8).reshape(src_h, src_w, 3).copy())
+        except Exception as e:                       # noqa: BLE001
+            err_box["reader"] = e
+        finally:
+            in_q.put(None)
+
+    def writer():
+        try:
+            while True:
+                frame = out_q.get()
+                if frame is None:
+                    break
+                enc.stdin.write(frame.tobytes())
+        except Exception as e:                       # noqa: BLE001
+            err_box["writer"] = e
+        finally:
+            try:
+                enc.stdin.close()
+            except OSError:
+                pass
+
+    rt = threading.Thread(target=reader, daemon=True)
+    wt = threading.Thread(target=writer, daemon=True)
+    rt.start(); wt.start()
+
+    def src_frames():
+        while True:
+            f = in_q.get()
+            if f is None:
+                return
+            yield f
+
+    enh = upscaler.enhance
+    if interpolating and abs(fps_out - fps_in) > 1e-6:
+        interp = interpolator.interpolate
+        if order == "post":          # upscale first, interpolate at target res
+            stream = _resample((enh(f) for f in src_frames()), fps_in, fps_out, interp)
+        else:                         # pre (default): interpolate at source res, then upscale
+            stream = (enh(f) for f in _resample(src_frames(), fps_in, fps_out, interp))
+    else:
+        stream = (enh(f) for f in src_frames())
+
+    t0 = time.time()
+    seg_frames = 0
+    for out_frame in stream:
+        if job._cancel.is_set():
+            break
+        job._wait_if_paused()
+        out_q.put(out_frame)
+        seg_frames += 1
+        job.done_frames += 1
+        elapsed = time.time() - t0
+        if elapsed > 0:
+            job.fps = seg_frames / elapsed
+        if on_progress and (seg_frames % 5 == 0):
+            on_progress(job)
+    out_q.put(None)
+    rt.join(timeout=5); wt.join(timeout=30)
+    dec.terminate()
+    enc.wait()
+    if err_box:
+        raise RuntimeError(f"segment pipe error: {err_box}")
+    if enc.returncode not in (0, None) and not job._cancel.is_set():
+        tail = (enc.stderr.read().decode('utf-8', 'replace').strip().splitlines()[-2:]
+                if enc.stderr else [])
+        raise RuntimeError("encoder failed: " + " | ".join(tail))
+    return seg_frames
+
+
+def run_job(job, upscaler, on_progress=None, interpolator=None):
+    """Full pipeline for one Job. `upscaler` is a ready Upscaler instance;
+    `interpolator` is an optional ready Interpolator (RIFE) for fps boost."""
+    job.status = "running"
+    job.started = time.time()
+    try:
+        meta = probe(job.src)
+        job.meta = {k: meta[k] for k in ("width", "height", "fps", "duration",
+                                         "nb_frames", "has_audio", "has_subs")}
+        job.total_frames = meta["nb_frames"] or 1
+        if interpolator:
+            fps_in = meta["fps"] or 30.0
+            fps_out = float(job.settings.get("fps") or 0) or fps_in * 2
+            job.total_frames = max(1, round(job.total_frames * fps_out / fps_in))
+            job.meta["fps_out"] = round(fps_out, 3)
+        scale = upscaler.scale
+        up_w, up_h = model_output_dims(meta["width"], meta["height"], scale)
+        target = parse_target(job.settings.get("target", "4k"))
+        video_args, _label = pick_encoder(job.settings)
+
+        scratch = _scratch_dir(job, job.settings.get("scratch"))
+        seg_seconds = job.settings.get("segment_seconds", DEFAULT_SEGMENT_SECONDS)
+        do_segment = (job.settings.get("segment", True)
+                      and meta["duration"] > seg_seconds * 1.5)
+
+        # 1) split (lossless) or single source
+        ext = os.path.splitext(job.src)[1] or ".mkv"
+        if do_segment:
+            pattern = os.path.join(scratch, f"src_%04d{ext}")
+            if not glob.glob(os.path.join(scratch, "src_*")):
+                _run(build_split_cmd(job.src, seg_seconds, pattern))
+            src_segs = sorted(glob.glob(os.path.join(scratch, f"src_*{ext}")))
+        else:
+            src_segs = [job.src]
+        job.total_segments = len(src_segs)
+
+        # 2) upscale each segment (resume: skip finished)
+        up_segs = []
+        for i, ss in enumerate(src_segs):
+            job.segment = i + 1
+            out_seg = os.path.join(scratch, "up_%04d.mkv" % i)
+            up_segs.append(out_seg)
+            if job.settings.get("resume", True) and os.path.isfile(out_seg) \
+                    and _seg_ok(out_seg):
+                info(f"  resume: segment {i+1}/{len(src_segs)} already done")
+                continue
+            if job._cancel.is_set():
+                break
+            _process_segment(job, upscaler, ss, meta, up_w, up_h, target,
+                             video_args, out_seg, on_progress, interpolator)
+            if job._cancel.is_set():
+                break
+
+        if job._cancel.is_set():
+            job.status = "cancelled"
+            return job
+
+        # 3) concat + 4) mux audio/subs from the original
+        body = os.path.join(scratch, "body.mkv")
+        if len(up_segs) == 1:
+            body = up_segs[0]
+        else:
+            listf = os.path.join(scratch, "concat.txt")
+            with open(listf, "w", encoding="utf-8") as f:
+                for s in up_segs:
+                    f.write(f"file '{s.replace(chr(39), chr(92) + chr(39))}'\n")
+            _run(build_concat_cmd(listf, body))
+
+        dst = unique_output(job.dst) if not job.settings.get("overwrite") else job.dst
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        metatag = (f"Upscaled with {upscaler.name} to {target[0]}x{target[1]} "
+                   f"(x{scale} model + lanczos)")
+        if interpolator:
+            metatag += (f"; frame-interpolated to {job.meta.get('fps_out')}fps "
+                        f"with {interpolator.name}")
+        _run(build_mux_cmd(body, job.src, dst,
+                           metatag, job.settings.get("container", "mkv")))
+        job.dst = dst
+
+        if not job.settings.get("keep_segments"):
+            shutil.rmtree(scratch, ignore_errors=True)
+
+        job.status = "done"
+        job.finished = time.time()
+        if on_progress:
+            on_progress(job)
+        return job
+    except Exception as e:                           # noqa: BLE001
+        job.status = "failed"
+        job.error = str(e)
+        job.finished = time.time()
+        if on_progress:
+            on_progress(job)
+        return job
+
+
+def _seg_ok(path):
+    """Cheap validity check for a finished segment (non-empty + probes)."""
+    try:
+        return os.path.getsize(path) > 1024 and probe(path)["nb_frames"] >= 0
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+class JobQueue:
+    """Serial queue with pause/cancel/persist — used by the web server."""
+
+    def __init__(self, persist_path=None):
+        self.jobs = []
+        self.persist_path = persist_path
+        self._lock = threading.Lock()
+        self._worker = None
+        self._stop = threading.Event()
+        self._upscalers = {}       # cache-key -> Upscaler
+        self._interps = {}         # cache-key -> Interpolator
+        self.on_change = None      # callback(job_dict or None) for broadcasts
+        self.current = None
+        self._load()
+
+    def _load(self):
+        """Restore jobs from a previous run (queue survives restarts)."""
+        if not self.persist_path or not os.path.isfile(self.persist_path):
+            return
+        try:
+            with open(self.persist_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        for jd in data:
+            try:
+                if not os.path.isfile(jd.get("src", "")):
+                    continue                      # source gone — drop it
+                job = Job(jd["src"], jd.get("settings", {}), dst=jd.get("dst"))
+                st = jd.get("status")
+                # anything unfinished becomes queued again (resume skips done segments)
+                job.status = "queued" if st in ("running", "paused", "queued") else st
+                job.meta = jd.get("meta", {})
+                self.jobs.append(job)
+            except (KeyError, TypeError):
+                continue
+        if any(j.status == "queued" for j in self.jobs):
+            self._ensure_worker()
+
+    def add(self, src, settings):
+        job = Job(src, settings)
+        with self._lock:
+            self.jobs.append(job)
+        self._changed(job)
+        self._ensure_worker()
+        return job
+
+    def get(self, job_id):
+        return next((j for j in self.jobs if j.id == job_id), None)
+
+    def remove(self, job_id):
+        job = self.get(job_id)
+        if not job:
+            return False
+        if job.status in ("running", "paused"):
+            job.cancel()
+        with self._lock:
+            self.jobs = [j for j in self.jobs if j.id != job_id]
+        self._save()
+        return True
+
+    def clear_finished(self):
+        with self._lock:
+            self.jobs = [j for j in self.jobs
+                         if j.status not in ("done", "failed", "cancelled")]
+        self._save()
+
+    def _ensure_worker(self):
+        if self._worker and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(target=self._run_loop, daemon=True)
+        self._worker.start()
+
+    def _run_loop(self):
+        while not self._stop.is_set():
+            job = next((j for j in self.jobs if j.status == "queued"), None)
+            if job is None:
+                return
+            self.current = job
+            try:
+                up = self._get_upscaler(job.settings)
+                interp = self._get_interpolator(job.settings, up) \
+                    if job.settings.get("interpolate") else None
+                run_job(job, up, on_progress=self._changed, interpolator=interp)
+            except Exception as e:                       # noqa: BLE001
+                job.status = "failed"
+                job.error = str(e)
+            self.current = None
+            self._changed(job)
+
+    def _get_upscaler(self, settings):
+        path = resolve_model(settings.get("model", DEFAULT_MODEL),
+                             settings.get("weights_dir", DEFAULT_WEIGHTS_DIR),
+                             assume_yes=True)
+        key = (path, settings.get("gpu", 0), settings.get("fp16", True),
+               settings.get("tile", 0))
+        if key not in self._upscalers:
+            self._upscalers[key] = Upscaler(
+                path, gpu=settings.get("gpu", 0), fp16=settings.get("fp16", True),
+                tile=settings.get("tile", 0), tile_pad=settings.get("tile_pad", 16))
+        return self._upscalers[key]
+
+    def _get_interpolator(self, settings, upscaler):
+        name = settings.get("rife_model", DEFAULT_RIFE_MODEL)
+        key = (name, settings.get("fp16", True))
+        if key not in self._interps:
+            self._interps[key] = Interpolator(
+                device=upscaler.device, fp16=settings.get("fp16", True),
+                model_name=name, weights_dir=settings.get("weights_dir", DEFAULT_WEIGHTS_DIR))
+        return self._interps[key]
+
+    def _changed(self, job):
+        self._save()
+        if self.on_change:
+            try:
+                self.on_change(job.to_dict() if isinstance(job, Job) else job)
+            except Exception:                        # noqa: BLE001
+                pass
+
+    def _save(self):
+        if not self.persist_path:
+            return
+        try:
+            with open(self.persist_path, "w", encoding="utf-8") as f:
+                json.dump([j.to_dict() for j in self.jobs], f, indent=2)
+        except OSError:
+            pass
+
+    def snapshot(self):
+        return [j.to_dict() for j in self.jobs]
+
+
+# ── dry-run planner ───────────────────────────────────────────────────────────
+def plan_and_print(src, settings):
+    """Print the full plan + every ffmpeg command without running anything."""
+    meta = probe(src)
+    # scale is model-native; without loading torch we look it up for builtins.
+    model_spec = settings.get("model", DEFAULT_MODEL)
+    scale = BUILTIN_MODELS.get(model_spec, (None, 4, None))[1]
+    up_w, up_h = model_output_dims(meta["width"], meta["height"], scale)
+    target = parse_target(settings.get("target", "4k"))
+    video_args, label = pick_encoder(settings)
+    seg_seconds = settings.get("segment_seconds", DEFAULT_SEGMENT_SECONDS)
+    do_segment = (settings.get("segment", True)
+                  and meta["duration"] > seg_seconds * 1.5)
+    n_segs = max(1, math.ceil(meta["duration"] / seg_seconds)) if do_segment else 1
+
+    div()
+    info(f"DRY RUN — {os.path.basename(src)}")
+    print(f"  source     : {meta['width']}x{meta['height']} @ {meta['fps']:.3f}fps, "
+          f"{_fmt(meta['duration'])}, {meta['nb_frames']} frames, {meta['vcodec']}")
+    print(f"  model      : {model_spec}  (native x{scale})")
+    print(f"  model out  : {up_w}x{up_h}  ->  target {target[0]}x{target[1]} (lanczos+pad)")
+    print(f"  encoder    : {label}")
+    print(f"  segments   : {n_segs} x ~{seg_seconds}s  (resume={settings.get('resume', True)})")
+    print(f"  output     : {default_output_path(src, settings)}")
+    print()
+    ex = "src_0000" + (os.path.splitext(src)[1] or ".mkv")
+    if do_segment:
+        print(f"{Fore.CYAN}  split :{Style.RESET_ALL} " +
+              _quote(build_split_cmd(src, seg_seconds,
+                                     os.path.join('<scratch>', 'src_%04d' + (os.path.splitext(src)[1] or '.mkv')))))
+    print(f"{Fore.CYAN}  decode:{Style.RESET_ALL} " +
+          _quote(build_decode_cmd(os.path.join('<scratch>', ex))))
+    print(f"{Fore.CYAN}  encode:{Style.RESET_ALL} " +
+          _quote(build_encode_cmd(up_w, up_h, meta['fps'] or 30.0, target[0],
+                                  target[1], os.path.join('<scratch>', 'up_0000.mkv'),
+                                  video_args, settings.get('pad_color', 'black'),
+                                  settings.get('pad', True))))
+    print(f"{Fore.CYAN}  mux   :{Style.RESET_ALL} " +
+          _quote(build_mux_cmd(os.path.join('<scratch>', 'body.mkv'), src,
+                               default_output_path(src, settings), 'Upscaled ...',
+                               settings.get('container', 'mkv'))))
+    div()
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+def _settings_from_args(a):
+    return {
+        "model": a.model, "target": a.target, "codec": a.codec, "qp": a.qp,
+        "preset": a.preset, "tune": a.tune, "pix_fmt": a.pix_fmt,
+        "gop": a.gop, "bf": a.bf, "rc_lookahead": a.rc_lookahead,
+        "aq_strength": a.aq_strength, "extra_enc": a.extra_enc,
+        "container": a.container, "suffix": a.suffix, "output_dir": a.output,
+        "overwrite": a.overwrite, "pad": not a.no_pad, "pad_color": a.pad_color,
+        "tile": a.tile, "tile_pad": a.tile_pad, "fp16": not a.fp32, "gpu": a.gpu,
+        "denoise": a.denoise, "weights_dir": a.weights_dir,
+        "segment": not a.no_segment, "segment_seconds": a.segment_seconds,
+        "resume": not a.no_resume, "keep_segments": a.keep_segments,
+        "scratch": a.scratch, "queue_size": a.queue_size,
+        "interpolate": a.interpolate, "fps": a.fps, "interp_order": a.interp_order,
+        "rife_model": a.rife_model, "assume_yes": a.yes,
+    }
+
+
+def _print_models():
+    div()
+    info("Builtin models (also: any local .pth/.safetensors or HuggingFace id)")
+    for name, (_url, scale, note) in BUILTIN_MODELS.items():
+        star = " (default)" if name == DEFAULT_MODEL else ""
+        print(f"  {Fore.WHITE}{Style.BRIGHT}{name}{Style.RESET_ALL}  x{scale}{star}")
+        print(f"      {note}")
+    div()
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="upscale_video.py",
+        description="AI video upscaler (open models, GPU-streaming pipeline). "
+                    "Give files/folders to run headless; use --serve for the web UI.")
+    p.add_argument("inputs", nargs="*", help="video files and/or folders (recurse)")
+    p.add_argument("-o", "--output", metavar="DIR", help="output folder")
+
+    g = p.add_argument_group("target")
+    g.add_argument("--target", default="4k", help="4k | 1080p | WxH (default 4k)")
+    g.add_argument("--no-pad", action="store_true", help="crop-to-fill instead of pad")
+    g.add_argument("--pad-color", default="black")
+
+    g = p.add_argument_group("model")
+    g.add_argument("--model", default=DEFAULT_MODEL,
+                   help="builtin name | local file | HF id (see --list-models)")
+    g.add_argument("--denoise", type=float, default=None, help="0..1 (models that support it)")
+    g.add_argument("--tile", type=int, default=0,
+                   help="tile size for VRAM; 0 = auto from free VRAM (default)")
+    g.add_argument("--tile-pad", type=int, default=16)
+    g.add_argument("--fp32", action="store_true", help="disable fp16 (slower, more VRAM)")
+    g.add_argument("--gpu", type=int, default=0)
+    g.add_argument("--weights-dir", default=DEFAULT_WEIGHTS_DIR)
+    g.add_argument("--list-models", action="store_true")
+
+    g = p.add_argument_group("interpolation")
+    g.add_argument("--interpolate", action="store_true", help="RIFE frame interpolation (fps boost)")
+    g.add_argument("--fps", type=float, default=None, help="target fps (default 2x source)")
+    g.add_argument("--rife-model", default=DEFAULT_RIFE_MODEL, choices=RIFE_MODELS)
+    g.add_argument("--interp-order", choices=["pre", "post"], default="pre",
+                   help="pre = interpolate then upscale (fast); post = upscale then interpolate")
+
+    g = p.add_argument_group("encode")
+    g.add_argument("--codec", default=ENC_DEFAULTS["codec"],
+                   choices=["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264"])
+    g.add_argument("--qp", default=ENC_DEFAULTS["qp"])
+    g.add_argument("--preset", default=ENC_DEFAULTS["preset"])
+    g.add_argument("--tune", default=ENC_DEFAULTS["tune"])
+    g.add_argument("--pix-fmt", dest="pix_fmt", default=ENC_DEFAULTS["pix_fmt"])
+    g.add_argument("--gop", default=ENC_DEFAULTS["gop"])
+    g.add_argument("--bf", default=ENC_DEFAULTS["bf"])
+    g.add_argument("--rc-lookahead", dest="rc_lookahead", default=ENC_DEFAULTS["rc_lookahead"])
+    g.add_argument("--aq-strength", dest="aq_strength", default=ENC_DEFAULTS["aq_strength"])
+    g.add_argument("--extra-enc", default=None, help="extra raw ffmpeg encode args")
+    g.add_argument("--container", default="mkv", choices=["mkv", "mp4"])
+    g.add_argument("--suffix", default="_upscaled")
+    g.add_argument("--overwrite", action="store_true")
+
+    g = p.add_argument_group("pipeline")
+    g.add_argument("--no-segment", action="store_true", help="single streaming pass")
+    g.add_argument("--segment-seconds", type=int, default=DEFAULT_SEGMENT_SECONDS)
+    g.add_argument("--no-resume", action="store_true")
+    g.add_argument("--keep-segments", action="store_true")
+    g.add_argument("--scratch", default=None, help="scratch base dir")
+    g.add_argument("--queue-size", type=int, default=6)
+
+    g = p.add_argument_group("misc")
+    g.add_argument("--dry-run", action="store_true", help="print plan+commands, run nothing")
+    g.add_argument("-y", "--yes", action="store_true", help="auto-confirm downloads")
+    g.add_argument("--verbose", action="store_true")
+    g.add_argument("--setup", action="store_true",
+                   help="create .venv and install CUDA torch + all deps")
+    g.add_argument("--cuda", default="cu128",
+                   help="pytorch CUDA index for --setup (cu128|cu126|cu124)")
+
+    g = p.add_argument_group("web ui")
+    g.add_argument("--serve", action="store_true", help="launch the web UI")
+    g.add_argument("--host", default="127.0.0.1")
+    g.add_argument("--port", type=int, default=DEFAULT_PORT)
+    g.add_argument("--open", action="store_true", help="open the browser")
+    return p
+
+
+def _cli_progress(job):
+    if job.status in ("done", "failed", "cancelled"):
+        return
+    eta = job.eta
+    line = ("  %s  %s %3d%%  seg %d/%d  %.0ffps  ETA %s" % (
+        os.path.basename(job.src)[:30], _bar(job.progress), int(job.progress * 100),
+        job.segment, job.total_segments, job.fps,
+        _fmt(eta) if eta is not None else "--"))
+    sys.stdout.write("\r" + line[:110].ljust(110))
+    sys.stdout.flush()
+
+
+def run_cli(args):
+    settings = _settings_from_args(args)
+    files = expand_inputs(args.inputs)
+    if not files:
+        warn("No videos found in the given paths.")
+        return 1
+
+    if args.dry_run:
+        for f in files:
+            plan_and_print(f, settings)
+        return 0
+
+    info("Detecting encoder ...")
+    _va, label = pick_encoder(settings)
+    info(f"Encoder → {label}")
+    # resolve + load the model once, reuse across files
+    model_path = resolve_model(args.model, args.weights_dir, assume_yes=args.yes)
+    info(f"Loading model {os.path.basename(model_path)} ...")
+    upscaler = Upscaler(model_path, gpu=args.gpu, fp16=not args.fp32,
+                        tile=args.tile, tile_pad=args.tile_pad)
+    info(f"Model ready: x{upscaler.scale}, fp16={upscaler.fp16}, "
+         f"tile={upscaler.tile}, device={upscaler.device}")
+
+    interpolator = None
+    if args.interpolate:
+        info(f"Loading RIFE interpolation model {args.rife_model} ...")
+        interpolator = Interpolator(device=upscaler.device, fp16=not args.fp32,
+                                    model_name=args.rife_model,
+                                    weights_dir=args.weights_dir)
+        info(f"Interpolation ready: {interpolator.name}, "
+             f"target {args.fps or '2x'} fps, order={args.interp_order}")
+
+    div()
+    print(f"{Fore.CYAN}{Style.BRIGHT}  UPSCALING {len(files)} file(s) → "
+          f"{args.target}{Style.RESET_ALL}")
+    div()
+    n_ok = n_fail = 0
+    for i, src in enumerate(files, 1):
+        job = Job(src, settings)
+        info(f"[{i}/{len(files)}] {os.path.basename(src)} → {os.path.basename(job.dst)}")
+        run_job(job, upscaler, on_progress=_cli_progress, interpolator=interpolator)
+        sys.stdout.write("\r" + " " * 110 + "\r")
+        if job.status == "done":
+            n_ok += 1
+            ok(f"[{i}/{len(files)}] {os.path.basename(job.dst)}")
+        else:
+            n_fail += 1
+            err(f"[{i}/{len(files)}] {job.status}: {job.error}")
+    div()
+    ok(f"{n_ok} done, {n_fail} failed")
+    return 0 if n_fail == 0 else 1
+
+
+def do_setup(args):
+    """Create .venv next to this script and install CUDA torch + all deps."""
+    venv_dir = os.path.join(HERE, ".venv")
+    py = os.path.join(venv_dir, "Scripts", "python.exe") if os.name == "nt" \
+        else os.path.join(venv_dir, "bin", "python")
+    if not os.path.isfile(py):
+        info(f"Creating venv at {venv_dir} ...")
+        rc = subprocess.call([sys.executable, "-m", "venv", venv_dir])
+        if rc != 0:
+            err("venv creation failed."); return 1
+    index = f"https://download.pytorch.org/whl/{args.cuda}"
+    steps = [
+        ([py, "-m", "pip", "install", "--upgrade", "pip"], "upgrade pip"),
+        ([py, "-m", "pip", "install", "torch", "torchvision", "--index-url", index],
+         f"install CUDA torch ({args.cuda}) — this is a large (~2.5GB) download"),
+        ([py, "-m", "pip", "install", "-r", os.path.join(HERE, "requirements.txt")],
+         "install the rest of the deps"),
+    ]
+    for cmd, desc in steps:
+        info(desc + " ...")
+        if subprocess.call(cmd) != 0:
+            err(f"step failed: {desc}"); return 1
+    check = subprocess.run(
+        [py, "-c", "import torch; print(torch.cuda.is_available(), "
+         "torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no CUDA')"],
+        capture_output=True, text=True)
+    div()
+    ok(f"Setup complete. torch CUDA → {check.stdout.strip()}")
+    info(f"Run with:  {py} upscale_video.py <video>   (or --serve)")
+    if "True" not in check.stdout:
+        warn("CUDA not available — try a different --cuda index (cu126/cu124) for your driver.")
+    return 0
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.setup:
+        return do_setup(args)
+
+    if args.list_models:
+        _print_models()
+        return 0
+
+    if args.serve:
+        try:
+            import server
+        except ImportError as e:
+            err(f"Web UI deps missing ({e}). pip install fastapi uvicorn")
+            return 1
+        return server.serve(args)
+
+    if not args.inputs:
+        parser.print_help()
+        print()
+        info("Tip: pass files/folders to upscale, or --serve for the web UI.")
+        return 0
+
+    return run_cli(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
