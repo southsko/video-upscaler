@@ -144,17 +144,21 @@ long run.
 AI upscaling is heavy — you're generating 4× the pixels with a neural net — so **model choice
 dominates everything**. Measured on an RTX 3080:
 
-| Source → 4K | Model | Throughput | ~2-hour movie |
-|---|---|---|---|
-| 480p → 4K | `realesr-animevideov3` (compact) | ~27 fps | ~real-time |
-| 1080p → 4K | `realesr-animevideov3` (compact) | ~6 fps | **~7 hours** |
-| 1080p → 4K | `realesrgan-x4plus` (heavy) | ~0.25 fps | **~8 days** ⚠️ |
+| Source → 4K | Model | Arch | Throughput | ~2-hour movie |
+|---|---|---|---|---|
+| 480p → 4K | `realesr-animevideov3` | tiny SRVGGNet | ~27 fps | ~real-time |
+| 1080p → 4K | `realesr-animevideov3` (anime) | tiny SRVGGNet | ~6.5 fps | ~7 hours |
+| 1080p → 4K | `2x-nomos-span` (live-action) | SPAN | ~2.8 fps | **~17 hours** |
+| 1080p → 4K | `realesrgan-x4plus` (heavy) | RRDBNet | ~0.25 fps | **~8 days** ⚠️ |
 
 Takeaways:
-- **Use a compact model for video** (`realesr-animevideov3` is ~25× faster than `x4plus`). Heavy
-  RRDBNet models (`x4plus`) are lovely for stills but impractical for full-length video.
-- Every ×4 model on a 1080p source makes an 8K frame then shrinks it to 4K — ¾ wasted compute. A
-  ×2-native model (roadmap) would make 1080p→4K ~4× faster.
+- **Speed is set by the model's *architecture size*, not the upscale factor.** The backbone runs at
+  the *input* resolution, so a ×2 and a ×4 model of the same size cost about the same; the output
+  scale only affects the tiny final upsample. Small backbones (SRVGGNet / SPAN) are the only
+  practical choice for full-length video.
+- **Pick by content:** `realesr-animevideov3` for anime/cartoons (fastest), **`2x-nomos-span` for
+  live-action film** (fast SPAN, native 4K from 1080p — the practical general choice). Heavy RRDBNet
+  models (`x4plus`) are lovely for stills but impractical for video (~8 days/movie).
 - The tool **benchmarks the first file and prints an ETA before starting** (disable with `--no-eta`),
   so a multi-hour — or multi-*day* — job is never a surprise.
 - The pipeline is already GPU-compute-bound and well-overlapped; batching and `torch.compile` were

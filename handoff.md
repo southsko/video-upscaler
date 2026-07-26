@@ -61,10 +61,15 @@ lossless dup-frame dedup. All committed & pushed.
 ## 6. Key measured findings (RTX 3080) — IMPORTANT
 - Pipeline is **GPU-compute-bound and already well-overlapped** (~30 fps end-to-end at 480p→4K =
   inference ceiling). **Batching and `torch.compile` gave NO gain** — do not re-add them.
-- **Model choice dominates.** 1080p→4K: `realesr-animevideov3` (compact) ≈ **6.5 fps** (~7h/movie);
-  `realesrgan-x4plus` (heavy RRDBNet) ≈ **0.25 fps** (~8 days — impractical for video).
-- **×4-on-1080p wastes ¾ compute** (makes 8K then shrinks to 4K). A **×2-native compact model** is the
-  single biggest remaining win (~4× faster for 1080p→4K). ← top TODO.
+- **Model choice dominates — and it's about ARCHITECTURE SIZE, not upscale factor.** The backbone
+  runs at INPUT resolution, so ×2 vs ×4 of the same-size net cost ~the same (measured: `2x-nomos-span`
+  ×2 = 2.8fps vs `animevideov3` ×4 = 6.5fps at 1080p; the ×2 is *slower* because it's a bigger net).
+  My earlier "×2 = 4× faster" theory was WRONG — disproven by measurement. Don't repeat it.
+- 1080p→4K throughput: `realesr-animevideov3` (tiny SRVGGNet, anime) ~6.5fps; `2x-nomos-span` (SPAN,
+  live-action) ~2.8fps (~17h/movie — practical); `realesrgan-x4plus` (heavy RRDBNet) ~0.25fps (~8
+  days — impractical). **Fast small backbones (SRVGGNet/SPAN) are the only viable choice for video.**
+- Added fast SPAN/Compact builtins (`2x-nomos-span`, `2x-parimg-compact`, HF-backed via `hf:` prefix
+  in BUILTIN_MODELS) so live-action film is finally practical.
 - **Exact-match dedup barely triggers on lossy-encoded video** (decoded "duplicate" frames aren't
   byte-identical). Needs a tolerance threshold to help real animation.
 
@@ -94,10 +99,12 @@ lossless dup-frame dedup. All committed & pushed.
 
 ## 9. TODO — prioritized roadmap (🔴 high / 🟡 med / ⚪ low)
 **Speed/efficiency**
-1. 🔴 Add a **×2-native compact model** (fast) so 1080p→4K makes native 4K, not 8K. ~4× faster.
-2. 🔴 **Scale-aware model auto-select** (`--model auto`): ×2 for ~2× ratio, ×4 for larger.
-3. 🟡 Label models by speed tier; steer video users off heavy `x4plus`.
-4. 🟡 `--dedup-threshold` for near-duplicate frames (helps real animation).
+1. ✅ DONE — added fast SPAN/Compact builtins (`2x-nomos-span` etc.); live-action now practical.
+2. 🟡 **Content-aware model auto-select** (`--model auto`): the hard part is detecting anime vs
+   live-action (can't be done from scale alone — my scale-based idea was wrong). Consider a cheap
+   heuristic (edge/palette stats) or just a UI hint. Lower priority than I first thought.
+3. ✅ DONE — models labelled by speed/content in `--list-models` and notes.
+4. 🟡 `--dedup-threshold` for near-duplicate frames (exact-match barely triggers on lossy video).
 5. ⚪ Surface the ETA in the web UI (currently CLI only).
 
 **Real-media correctness**

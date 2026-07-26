@@ -84,18 +84,27 @@ TARGET_PRESETS = {
 # can load also works via a local path or a HuggingFace id, so this is just a
 # curated shortcut list (printed by --list-models).
 BUILTIN_MODELS = {
+    # name: (source, native_scale, note).  source = direct URL or "hf:repo[/id][:file]".
+    # FAST models (small SRVGGNet/SPAN backbones) — the only practical ones for full video.
     "realesr-animevideov3": (
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth",
-        4, "Anime/cartoon VIDEO — fast, great for animation (default)"),
-    "realesrgan-x4plus": (
-        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-        4, "General / live-action, x4"),
-    "realesrgan-x4plus-anime": (
-        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
-        4, "Anime stills, x4 (lighter 6-block net)"),
+        4, "Anime/cartoon VIDEO — FASTEST (~6.5fps @1080p→4K on a 3080). Default."),
+    "2x-nomos-span": (
+        "hf:Phips/2xNomosUni_span_multijpg_ldl",
+        2, "General / LIVE-ACTION (SPAN, fast, ~2.8fps). Best practical film upscaler; native 4K from 1080p."),
+    "2x-parimg-compact": (
+        "hf:Phips/2xParimgCompact",
+        2, "Photo / live-action (Compact, fast). Native 4K from 1080p."),
     "realesr-general-x4v3": (
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
-        4, "General purpose, x4, supports denoise blend"),
+        4, "General purpose, x4 (compact, moderate speed)."),
+    # HEAVY models (RRDBNet) — great for stills, IMPRACTICAL for full video (~0.25fps @1080p→4K).
+    "realesrgan-x4plus": (
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        4, "General/live-action, HIGH QUALITY but VERY SLOW (~0.25fps @1080p→4K ≈ 8 days/movie). Stills only."),
+    "realesrgan-x4plus-anime": (
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+        4, "Anime stills, x4 (lighter 6-block RRDBNet)."),
 }
 DEFAULT_MODEL = os.environ.get("UPSCALE_MODEL", "realesr-animevideov3")
 
@@ -236,6 +245,8 @@ def resolve_model(spec, weights_dir=DEFAULT_WEIGHTS_DIR, assume_yes=False,
     # 2) builtin name
     if spec in BUILTIN_MODELS:
         url, _scale, _note = BUILTIN_MODELS[spec]
+        if url.startswith("hf:"):                    # HF-backed builtin
+            return resolve_model(url[3:], weights_dir, assume_yes, confirm)
         fname = os.path.basename(url)
         dest = os.path.join(weights_dir, fname)
         if os.path.isfile(dest):
