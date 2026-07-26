@@ -242,6 +242,34 @@ async function addPaths(paths) {
   } catch (e) { toast("Add failed", e.message, "bad"); }
 }
 
+/* ── model benchmark ─────────────────────────────────────── */
+async function runBenchmark() {
+  const btn = $("bench-btn"), box = $("bench-results");
+  // benchmark the practical (fast) models by default — heavy ones are labelled slow
+  const models = state.models.filter((m) => !/x4plus/.test(m.name)).map((m) => m.name);
+  btn.disabled = true; btn.textContent = "⏳ Benchmarking…";
+  box.style.display = "block";
+  box.innerHTML = `<div class="bhead">Measuring ${models.length} models at 1080p→4K on your GPU… (10–30s; GPU load affects results)</div>`;
+  try {
+    const r = await post("/api/benchmark", { models, res: "1920x1080" });
+    const ok = r.results.filter((x) => x.fps);
+    const max = Math.max(1, ...ok.map((x) => x.fps));
+    box.innerHTML = `<div class="bhead">1080p→4K on this GPU · click a row to select · fastest first</div>` +
+      r.results.map((x, i) => x.error
+        ? `<div class="brow err"><span class="bname">${esc(x.name)} — ${esc(x.error)}</span></div>`
+        : `<div class="brow ${i === 0 ? "fastest" : ""}" data-m="${esc(x.name)}">
+             <span class="bname">${esc(x.name)} <span style="color:var(--text-faint)">x${x.scale}</span></span>
+             <span class="bmeter"><span style="width:${Math.round(100*x.fps/max)}%"></span></span>
+             <span class="bfps">${x.fps} fps</span>
+           </div>`).join("");
+    box.querySelectorAll(".brow[data-m]").forEach((el) => el.onclick = () => {
+      $("model").value = el.dataset.m; updateModelNote();
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="bhead" style="color:var(--danger)">Benchmark failed: ${esc(e.message)}</div>`;
+  } finally { btn.disabled = false; btn.textContent = "⚡ Benchmark"; }
+}
+
 /* ── preview + comparison slider ─────────────────────────── */
 async function runPreview() {
   const file = $("preview-file").value.trim();
@@ -311,6 +339,7 @@ function wire() {
   $("add-folder-btn").onclick = () => addPaths([curPath]);
   $("preview-btn").onclick = runPreview;
   $("model").onchange = updateModelNote;
+  $("bench-btn").onclick = runBenchmark;
   $("interpolate").onchange = (e) => $("fps-field").style.display = e.target.checked ? "" : "none";
   document.querySelectorAll("#target-seg button").forEach((b) =>
     b.onclick = () => {

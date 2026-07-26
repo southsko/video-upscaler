@@ -204,6 +204,20 @@ def create_app(state):
         q._changed(job)
         return job.to_dict()
 
+    @app.post("/api/benchmark")
+    async def api_benchmark(request: Request, token: str = Query(None)):
+        check_token(request, token)
+        if not _torch_ok():
+            raise HTTPException(503, "Benchmark needs torch/CUDA installed")
+        body = await request.json()
+        names = body.get("models") or None
+        res = body.get("res", "1920x1080")
+        try:
+            results = await run_in_threadpool(U.benchmark_models, names, res)
+        except Exception as e:                        # noqa: BLE001
+            raise HTTPException(500, f"Benchmark failed: {e}")
+        return {"res": res, "results": results}
+
     @app.post("/api/preview")
     async def api_preview(request: Request, token: str = Query(None)):
         check_token(request, token)

@@ -1348,6 +1348,42 @@ def run_benchmark(args):
     return 0
 
 
+def benchmark_models(names=None, res="1920x1080", gpu=0, fp16=True, tile=0,
+                     weights_dir=DEFAULT_WEIGHTS_DIR):
+    """Benchmark models on a synthetic frame; return a sorted list of dicts
+    {name, scale, fps, ms, note} (or {name, error}). Used by CLI + web UI."""
+    import numpy as np
+    import torch
+    names = names or list(BUILTIN_MODELS)
+    try:
+        w, h = parse_target(res)
+    except ValueError:
+        w, h = 1920, 1080
+    frame = (np.random.rand(h, w, 3) * 255).astype(np.uint8)
+    out = []
+    for name in names:
+        try:
+            path = resolve_model(name, weights_dir, assume_yes=True)
+            up = Upscaler(path, gpu=gpu, fp16=fp16, tile=tile)
+            for _ in range(3):
+                up.enhance(frame)
+            if up.device.type == "cuda":
+                torch.cuda.synchronize()
+            t = time.time(); up.enhance(frame); t1 = time.time() - t
+            n = max(3, min(20, int(2.0 / max(t1, 1e-3))))
+            fps = benchmark_fps(up, frame, n=n, warmup=0)
+            out.append({"name": name, "scale": up.scale, "fps": round(fps, 1),
+                        "ms": round(1000 / fps) if fps else None,
+                        "note": BUILTIN_MODELS.get(name, ("", up.scale, ""))[2]})
+            del up
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:                       # noqa: BLE001
+            out.append({"name": name, "error": str(e)[:100]})
+    out.sort(key=lambda r: (r.get("fps") is None, -(r.get("fps") or 0)))
+    return out
+
+
 def _fmt_long(secs):
     secs = int(max(0, secs))
     d, r = divmod(secs, 86400)

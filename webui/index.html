@@ -84,9 +84,13 @@
 
           <div class="grouphead">Model</div>
           <div class="field">
-            <label>Upscaling model</label>
+            <label>Upscaling model
+              <button class="btn ghost sm" id="bench-btn" style="float:right;padding:3px 9px;font-size:11px"
+                title="Measure speed of each model on your GPU">⚡ Benchmark</button>
+            </label>
             <select id="model"></select>
             <div class="hint" id="model-note"></div>
+            <div id="bench-results" class="bench" style="display:none"></div>
           </div>
           <div class="field">
             <label>…or a HuggingFace id / local path</label>
