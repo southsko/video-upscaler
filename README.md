@@ -139,6 +139,27 @@ long run.
 
 ---
 
+## Performance
+
+AI upscaling is heavy — you're generating 4× the pixels with a neural net — so **model choice
+dominates everything**. Measured on an RTX 3080:
+
+| Source → 4K | Model | Throughput | ~2-hour movie |
+|---|---|---|---|
+| 480p → 4K | `realesr-animevideov3` (compact) | ~27 fps | ~real-time |
+| 1080p → 4K | `realesr-animevideov3` (compact) | ~6 fps | **~7 hours** |
+| 1080p → 4K | `realesrgan-x4plus` (heavy) | ~0.25 fps | **~8 days** ⚠️ |
+
+Takeaways:
+- **Use a compact model for video** (`realesr-animevideov3` is ~25× faster than `x4plus`). Heavy
+  RRDBNet models (`x4plus`) are lovely for stills but impractical for full-length video.
+- Every ×4 model on a 1080p source makes an 8K frame then shrinks it to 4K — ¾ wasted compute. A
+  ×2-native model (roadmap) would make 1080p→4K ~4× faster.
+- The tool **benchmarks the first file and prints an ETA before starting** (disable with `--no-eta`),
+  so a multi-hour — or multi-*day* — job is never a surprise.
+- The pipeline is already GPU-compute-bound and well-overlapped; batching and `torch.compile` were
+  measured to give no gain on these models, so they aren't used.
+
 ## Notes & caveats
 
 - **GPU / tiling:** `--tile 0` (default) auto-sizes the tile from free VRAM (512 on a 10 GB card);

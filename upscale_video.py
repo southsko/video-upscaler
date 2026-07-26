@@ -373,9 +373,10 @@ class Upscaler:
         t = t.unsqueeze(0).to(self.device).float().div_(255.0)
         if self.fp16:
             t = t.half()
-        out = self._tiled(t)
-        out = out.squeeze(0).permute(1, 2, 0).clamp_(0, 1).mul_(255.0)
-        return out.round().to(torch.uint8).cpu().numpy()
+        # non-inplace: the no-tile path returns spandrel's inference-mode tensor,
+        # which forbids in-place ops (the tiled path returns a fresh tensor).
+        out = self._tiled(t).squeeze(0).permute(1, 2, 0).clamp(0, 1)
+        return (out * 255).round().to(torch.uint8).cpu().numpy()
 
 
 # RIFE model names available via ccvfi.ConfigType.
@@ -618,6 +619,7 @@ class Job:
         # progress
         self.total_frames = 0
         self.done_frames = 0
+        self.deduped = 0             # frames reused via duplicate detection
         self.segment = 0
         self.total_segments = 0
         self.fps = 0.0
@@ -664,6 +666,7 @@ class Job:
             "status": self.status, "error": self.error,
             "progress": round(self.progress, 4),
             "done_frames": self.done_frames, "total_frames": self.total_frames,
+            "deduped": self.deduped,
             "segment": self.segment, "total_segments": self.total_segments,
             "fps": round(self.fps, 1), "eta": self.eta,
             "settings": self.settings, "meta": self.meta,
@@ -708,6 +711,29 @@ def _resample(frames, fps_in, fps_out, interp):
     while j * step <= i + 1e-9:  # tail: hold the final frame
         yield a
         j += 1
+
+
+class _DedupEnhance:
+    """Reuse the previous upscaled frame when the incoming source frame is
+    byte-identical to the last one. Lossless (identical input -> identical
+    output) and a big win on animation, which often holds a frame 2-3x."""
+
+    def __init__(self, enhance):
+        import numpy as np
+        self._np = np
+        self.enhance = enhance
+        self.prev = None
+        self.prev_out = None
+        self.reused = 0
+
+    def __call__(self, frame):
+        if (self.prev is not None and frame.shape == self.prev.shape
+                and self._np.array_equal(frame, self.prev)):
+            self.reused += 1
+            return self.prev_out
+        self.prev = frame
+        self.prev_out = self.enhance(frame)
+        return self.prev_out
 
 
 def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
@@ -776,6 +802,9 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
             yield f
 
     enh = upscaler.enhance
+    dedup = _DedupEnhance(enh) if job.settings.get("dedup", True) else None
+    if dedup:
+        enh = dedup
     if interpolating and abs(fps_out - fps_in) > 1e-6:
         interp = interpolator.interpolate
         if order == "post":          # upscale first, interpolate at target res
@@ -799,6 +828,8 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
             job.fps = seg_frames / elapsed
         if on_progress and (seg_frames % 5 == 0):
             on_progress(job)
+    if dedup:
+        job.deduped += dedup.reused
     out_q.put(None)
     rt.join(timeout=5); wt.join(timeout=30)
     dec.terminate()
@@ -1048,6 +1079,85 @@ class JobQueue:
         return [j.to_dict() for j in self.jobs]
 
 
+# ── speed benchmark / upfront ETA ─────────────────────────────────────────────
+def sample_frame(path, at=None):
+    """Grab one decoded RGB uint8 frame from a file (for benchmarking/preview)."""
+    import numpy as np
+    meta = probe(path)
+    w, h = meta["width"], meta["height"]
+    ts = at if at is not None else min(10.0, (meta["duration"] or 20.0) / 2)
+    raw = subprocess.run(
+        ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', str(ts),
+         '-i', path, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
+        capture_output=True).stdout
+    if len(raw) < w * h * 3:
+        return None
+    return np.frombuffer(raw[:w * h * 3], np.uint8).reshape(h, w, 3).copy()
+
+
+def benchmark_fps(upscaler, frame, n=6, warmup=2):
+    """Measured upscale throughput (frames/s) for this model at this resolution."""
+    torch = upscaler.torch
+    for _ in range(warmup):
+        upscaler.enhance(frame)
+    if upscaler.device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(n):
+        upscaler.enhance(frame)
+    if upscaler.device.type == "cuda":
+        torch.cuda.synchronize()
+    dt = time.time() - t0
+    return n / dt if dt > 0 else 0.0
+
+
+def estimate_and_report(upscaler, files, settings):
+    """Benchmark on the first file and print a per-file + total ETA up front, so a
+    multi-hour (or multi-day!) job is never a surprise. Returns measured fps."""
+    frame = sample_frame(files[0])
+    if frame is None:
+        return None
+    fps = benchmark_fps(upscaler, frame)
+    if fps <= 0:
+        return None
+    h, w = frame.shape[:2]
+    interp_mult = 1.0
+    if settings.get("interpolate"):
+        fin = probe(files[0]).get("fps") or 30.0
+        fout = float(settings.get("fps") or 0) or fin * 2
+        interp_mult = fout / fin
+    total_frames = 0
+    for f in files:
+        try:
+            total_frames += probe(f)["nb_frames"]
+        except Exception:                            # noqa: BLE001
+            pass
+    total_out = total_frames * interp_mult
+    est = total_out / fps if fps else 0
+    div()
+    info(f"Benchmark: {Fore.WHITE}{Style.BRIGHT}{fps:.1f} fps{Style.RESET_ALL} "
+         f"at {w}x{h} with {upscaler.name} (x{upscaler.scale})")
+    info(f"Estimated: {Fore.WHITE}{Style.BRIGHT}~{_fmt_long(est)}{Style.RESET_ALL} "
+         f"for {len(files)} file(s) (~{int(total_out):,} output frames)")
+    if est > 6 * 3600:
+        warn(f"That's a long run. Faster options: a compact model "
+             f"(realesr-animevideov3 is ~25x faster than x4plus), a lower "
+             f"--target, or --interpolate off.")
+    return fps
+
+
+def _fmt_long(secs):
+    secs = int(max(0, secs))
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m, _s = divmod(r, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m {_s}s"
+
+
 # ── dry-run planner ───────────────────────────────────────────────────────────
 def plan_and_print(src, settings):
     """Print the full plan + every ffmpeg command without running anything."""
@@ -1103,6 +1213,7 @@ def _settings_from_args(a):
         "overwrite": a.overwrite, "pad": not a.no_pad, "pad_color": a.pad_color,
         "tile": a.tile, "tile_pad": a.tile_pad, "fp16": not a.fp32, "gpu": a.gpu,
         "denoise": a.denoise, "weights_dir": a.weights_dir,
+        "dedup": not a.no_dedup,
         "segment": not a.no_segment, "segment_seconds": a.segment_seconds,
         "resume": not a.no_resume, "keep_segments": a.keep_segments,
         "scratch": a.scratch, "queue_size": a.queue_size,
@@ -1170,6 +1281,8 @@ def build_parser():
     g.add_argument("--overwrite", action="store_true")
 
     g = p.add_argument_group("pipeline")
+    g.add_argument("--no-dedup", action="store_true",
+                   help="disable duplicate-frame reuse (lossless speedup on animation)")
     g.add_argument("--no-segment", action="store_true", help="single streaming pass")
     g.add_argument("--segment-seconds", type=int, default=DEFAULT_SEGMENT_SECONDS)
     g.add_argument("--no-resume", action="store_true")
@@ -1179,6 +1292,7 @@ def build_parser():
 
     g = p.add_argument_group("misc")
     g.add_argument("--dry-run", action="store_true", help="print plan+commands, run nothing")
+    g.add_argument("--no-eta", action="store_true", help="skip the upfront benchmark/ETA")
     g.add_argument("-y", "--yes", action="store_true", help="auto-confirm downloads")
     g.add_argument("--verbose", action="store_true")
     g.add_argument("--setup", action="store_true",
@@ -1238,6 +1352,12 @@ def run_cli(args):
         info(f"Interpolation ready: {interpolator.name}, "
              f"target {args.fps or '2x'} fps, order={args.interp_order}")
 
+    if not args.no_eta:
+        try:
+            estimate_and_report(upscaler, files, settings)
+        except Exception as e:                       # noqa: BLE001
+            warn(f"(couldn't estimate time: {e})")
+
     div()
     print(f"{Fore.CYAN}{Style.BRIGHT}  UPSCALING {len(files)} file(s) → "
           f"{args.target}{Style.RESET_ALL}")
@@ -1250,7 +1370,10 @@ def run_cli(args):
         sys.stdout.write("\r" + " " * 110 + "\r")
         if job.status == "done":
             n_ok += 1
-            ok(f"[{i}/{len(files)}] {os.path.basename(job.dst)}")
+            saved = (f"  ({job.deduped} dup frames reused, "
+                     f"{100*job.deduped/max(1,job.done_frames):.0f}% skipped)"
+                     if job.deduped else "")
+            ok(f"[{i}/{len(files)}] {os.path.basename(job.dst)}{saved}")
         else:
             n_fail += 1
             err(f"[{i}/{len(files)}] {job.status}: {job.error}")
