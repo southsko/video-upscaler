@@ -17,21 +17,40 @@ Quality ladder, all riding ONE multi-frame pipe:
 ### Tier 3 / SeedVR2 integration — how it actually plugs in
 SeedVR2 can't live in our py3.14 venv (heavy deps). So the design is **orchestration, not in-process**:
 `--external-cmd` runs ANY external video-to-video upscaler **per segment in its own env/GPU**, and our
-tool wraps it with split/resume/concat/audio-mux. The plumbing is built and verified with an ffmpeg
-stand-in (`_run_external_segment` / `_external_args`). To finish on the 24 GB box:
-1. Install SeedVR2 in ITS OWN environment (clone ByteDance-Seed/SeedVR, its deps, download 3B/FP8 weights).
-   Linux strongly preferred (xformers/flash-attn wheels exist there for a supported Python).
-2. Wrap its inference as a video-in/video-out command, then:
-   ```
-   python upscale_video.py "movie.mkv" --target 4k --segment-seconds 60 \
-     --external-cmd "python /opt/SeedVR2/infer_video.py --input {input} --output {output} --res {target} --model 3b-fp8"
-   ```
-   Placeholders: `{input} {output} {width} {height} {target}`. Our tool handles everything around it.
-3. Tune `--segment-seconds` down (e.g. 30–60) since diffusion is slow and you want frequent resume points.
+tool wraps it with split/resume/concat/audio-mux. The plumbing is BUILT + VERIFIED with an ffmpeg
+stand-in (`_run_external_segment` / `_external_args`, run_job external branch, `--external-cmd` CLI).
+
+### ✅ Done (our side, verified on the 10 GB box)
+- Per-segment external orchestration, placeholder substitution ({input}{output}{width}{height}{target}),
+  split → resume → concat → audio/sub mux around the external command. Unit-tested + stand-in verified.
+
+### ⬜ What's LEFT to finish tier 3 (do on the 24 GB box — needs SeedVR2 + big VRAM)
+1. **Install SeedVR2 in its OWN environment** (do NOT add to our venv): clone `ByteDance-Seed/SeedVR`,
+   create a separate conda/venv, install its deps (torch + diffusers + xformers + flash-attn, maybe
+   apex). **Linux strongly preferred** — xformers/flash-attn have wheels there for a supported Python;
+   on Windows/py3.14 they don't. The Z:\ server (has `stable-diffusion`/`tdarr` already) is the natural home.
+2. **Download weights** — SeedVR2 3B (FP8/GGUF quant to fit 24 GB) from its HuggingFace; note the path.
+3. **Find SeedVR2's real inference interface** (I could NOT verify it — the repo page was sparse). Read
+   its `infer*.py`/README: does it take a **video file** or a **folder of frames**? What are the exact
+   flags (input, output, resolution, model path, tile/vram, steps)?
+4. **If it's frames-folder-based** (likely), write a tiny wrapper script `seedvr2_vidwrap.sh/py` that:
+   `ffmpeg extract {input} → PNG dir` → run SeedVR2 on the dir → `ffmpeg reassemble → {output}` (video-only,
+   at {target}). Then point `--external-cmd` at that wrapper. If it's already video-in/video-out, skip this.
+5. **VRAM-tune on 24 GB**: pick FP8/quant, set SeedVR2's internal tile/chunk so 4K fits; SeedVR2 has its
+   own temporal window — our `--segment-seconds` just bounds resume granularity. Use short segments
+   (30–60s) because diffusion is slow and you want frequent resume points.
+6. **Verify**: output is {target} res, plays, audio preserved (we mux it), duration matches; check the
+   segment-boundary seams are acceptable (SeedVR2 resets temporal state per segment, like our other tiers).
+7. **(Optional) polish**: add a `--diffusion` convenience alias that fills in the `--external-cmd` for a
+   known SeedVR2 install path; expose `external_cmd` in the web UI settings (currently CLI-only — the
+   JobQueue already carries settings, the frontend just lacks a field); a `models/` note for the weights.
+8. **(Optional, better) in-process** later: if anyone packages SeedVR2 as a pip lib, wrap it as a class
+   with `is_temporal=True` + `enhance_clip(frames)->frames` and it drops into `_vsr_stream` directly —
+   same seam as `VSRUpscaler`. External-cmd is the pragmatic path for now.
 
 The architecture bet paid off: **the multi-frame window (`_vsr_stream`) AND the external per-segment
 seam are both built** — temporal VSR uses the window now; a diffusion model plugs in via `--external-cmd`
-today (or in-process later via the same `enhance_clip`/`is_temporal` protocol if someone packages it).
+today (or in-process later via the same `enhance_clip`/`is_temporal` protocol).
 
 ## 1. What this project is
 A free, self-hosted **AI video upscaler**: streams frames `ffmpeg decode → GPU super-resolution →
@@ -53,6 +72,17 @@ engine. (Do **not** reference "Topaz" anywhere — deliberately scrubbed.)
 - torch CUDA wheels for py3.14 only exist on the **cu128/cu126** indexes (not cu124). `--setup`
   reproduces the env.
 - **Ampere can't AV1-encode** — use h264_nvenc/hevc_nvenc.
+
+### Runs on BOTH the owner's machines (10 GB workstation + 24 GB server)
+Same code, same commands — it is **GPU-adaptive** (auto-tile reads free VRAM: ~512 on 10 GB, ~1024 on
+24 GB; auto-detects CUDA). Nothing in the normal pipeline requires a big card.
+- **10 GB (RTX 3080, dev/workstation):** Tier 1 (single-image, default) and Tier 2 (`--vsr`) both run
+  here — all testing was done on this card. Tier 3 diffusion is NOT usable (VRAM) — just don't pass
+  `--external-cmd`. For `--vsr` on 10 GB keep `--vsr-window` modest (8–16) to avoid OOM (it's fp32).
+- **24 GB (server):** all three tiers, incl. diffusion via `--external-cmd`. Bigger `--vsr-window` OK.
+- The tiers are independent: diffusion runs as a separate external process, so it never affects or
+  burdens the normal single-image/VSR pipeline. Nothing to configure differently per machine except
+  whether you add `--external-cmd`.
 
 ## 3. Files
 - `upscale_video.py` — engine + CLI (everything: probe, model loading, streaming pipe, encoder
