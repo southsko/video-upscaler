@@ -116,6 +116,12 @@ python upscale_video.py clip.mkv --model 4x-UltraSharp --target 2560x1440
 # Upscale AND boost frame rate to 60fps (RIFE interpolation)
 python upscale_video.py clip.mkv --interpolate --fps 60
 
+# Temporal VSR (multi-frame, less flicker than single-image) — great for anime
+python upscale_video.py clip.mkv --vsr --vsr-model AnimeSR_v2_4x --vsr-window 16
+
+# Compare model speeds on YOUR GPU (run on an idle GPU for accurate numbers)
+python upscale_video.py clip.mkv --benchmark
+
 # See exactly what it would run, without running it
 python upscale_video.py clip.mkv --dry-run
 ```

@@ -12,6 +12,7 @@
 # --- core inference ---
 spandrel>=0.4.1          # loads ESRGAN/Real-ESRGAN/SwinIR/HAT/DAT/SPAN/... checkpoints by arch auto-detect
 ccvfi>=0.0.3             # RIFE frame interpolation (auto-downloads weights)
+ccrestoration>=0.0.1     # temporal VSR (AnimeSR/BasicVSR/IconVSR/EDVR); auto-downloads weights
 huggingface_hub>=0.24    # download models by HF repo id
 numpy>=1.24
 opencv-python>=4.9       # frame <-> ndarray, preview JPEG encode

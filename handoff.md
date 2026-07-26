@@ -2,6 +2,20 @@
 
 Self-contained context so a fresh session (any model) can continue without prior history.
 
+## 0. North star (long-term direction — decided with the owner)
+Target hardware is **24 GB VRAM** (owner is NOT upgrading beyond that; the 3080/10GB is the dev box).
+Quality ladder, all riding ONE multi-frame pipe:
+1. **Single-image SR** (spandrel: Real-ESRGAN/SPAN/Compact) — fast everyday workhorse. ✅ done.
+2. **Temporal VSR** (ccrestoration: AnimeSR/BasicVSR/IconVSR/EDVR) — multi-frame, less flicker. ✅ done
+   (`--vsr`). The realistic quality ceiling on 24 GB at sane speed.
+3. **Diffusion video restoration** — the true ceiling. **Target model: SeedVR2** (ICLR2026,
+   github.com/IceClear/SeedVR2) — *one-step* diffusion VSR, 3B/7B with FP8/GGUF quant to fit 24 GB.
+   NOT built. Needs a `diffusers`-style backend as a heavy opt-in tier; reuses the same multi-frame
+   window the VSR pipe already established. This is the big future build.
+
+The architecture bet that makes this cheap: **the multi-frame window (`_vsr_stream`) is built once** —
+temporal VSR uses it now; the diffusion backend plugs into the same seam later.
+
 ## 1. What this project is
 A free, self-hosted **AI video upscaler**: streams frames `ffmpeg decode → GPU super-resolution →
 ffmpeg NVENC encode` with **no PNG files touching disk**. Open models via `spandrel` (Real-ESRGAN
@@ -74,6 +88,8 @@ lossless dup-frame dedup. All committed & pushed.
   byte-identical). Needs a tolerance threshold to help real animation.
 
 ## 7. Gotchas (things that bit us — keep in mind)
+- **ccrestoration VSR is fp32-only** — its VSR inference doesn't cast inputs to half, so fp16 crashes
+  ("Input type float / bias type Half"). `VSRUpscaler` forces fp32 (fine on 24 GB). ccvfi (RIFE) fp16 is fine.
 - spandrel's model `__call__` returns an **inference-mode tensor** → do **non-inplace** post-processing
   (no `.clamp_()`/`.mul_()`). Both `Upscaler.enhance` and `Interpolator.interpolate` were fixed;
   keep any new tensor code non-inplace or `.clone()` first.

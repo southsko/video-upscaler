@@ -67,6 +67,20 @@ def test_resample_empty():
     assert list(U._resample(iter([]), 30, 60, lambda *a: a)) == []
 
 
+# ── temporal VSR windowing ───────────────────────────────────────────────────
+def test_vsr_stream_frame_exact():
+    frames = [("f", i) for i in range(10)]
+    seen_windows = []
+
+    def clip_identity(clip):
+        seen_windows.append(len(clip))
+        return list(clip)
+
+    out = list(U._vsr_stream(iter(frames), clip_identity, window=4))
+    assert out == frames                 # frame-exact, order preserved, none dropped
+    assert seen_windows == [4, 4, 2]     # 10 frames -> windows of 4,4,2
+
+
 # ── scratch dir keying (resume across restarts) ──────────────────────────────
 def test_scratch_stable_and_distinct(tmp_path):
     j1 = U.Job("C:/x/movie.mkv", {"target": "4k", "model": "m"})

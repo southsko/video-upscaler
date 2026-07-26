@@ -437,6 +437,73 @@ class Interpolator:
         return (out * 255).round().to(torch.uint8).cpu().numpy()
 
 
+# Temporal (multi-frame) VSR models via ccrestoration — reduce flicker by using
+# neighbouring frames. These are NOT spandrel-loadable; ccrestoration is the loader.
+VSR_MODELS = ["AnimeSR_v2_4x", "BasicVSR_REDS_4x", "IconVSR_REDS_4x",
+              "EDVR_M_SR_REDS_official_4x"]
+DEFAULT_VSR_MODEL = os.environ.get("UPSCALE_VSR_MODEL", "AnimeSR_v2_4x")
+
+
+class VSRUpscaler:
+    """Temporal video super-resolution: processes a *window* of frames together
+    for temporal consistency (less flicker) than single-image SR. Duck-types the
+    bits of Upscaler that run_job needs (scale/name/device/enhance) plus
+    enhance_clip() and is_temporal for the windowed pipe path."""
+
+    is_temporal = True
+
+    def __init__(self, config_name=DEFAULT_VSR_MODEL, gpu=0, fp16=True, tile=128,
+                 tile_pad=8, window=16, weights_dir=DEFAULT_WEIGHTS_DIR):
+        import torch
+        from ccrestoration import AutoModel, ConfigType
+        self.torch = torch
+        self.device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
+        if self.device.type != "cuda":
+            warn("CUDA not available — temporal VSR on CPU is extremely slow.")
+        # ccrestoration's VSR inference doesn't cast inputs to half, so fp16 crashes
+        # ("Input type float / bias type Half"). Force fp32 — fine on a 24GB target.
+        self.fp16 = False
+        cfg = getattr(ConfigType, config_name)
+        os.makedirs(weights_dir, exist_ok=True)
+        tilearg = (int(tile), int(tile)) if tile and int(tile) > 0 else None
+        self.model = AutoModel.from_pretrained(
+            cfg, device=self.device, fp16=False, tile=tilearg,
+            tile_pad=tile_pad, model_dir=weights_dir)
+        self.name = config_name
+        self.window = max(2, int(window))
+        try:
+            self.scale = int(config_name.rsplit("_", 1)[-1].rstrip("xX"))
+        except ValueError:
+            self.scale = int(getattr(self.model, "scale", 4))
+
+    def enhance_clip(self, rgb_frames):
+        """List of HxWx3 RGB uint8 -> list of upscaled HxWx3 RGB uint8.
+        ccrestoration works in BGR, so reverse channels around it."""
+        import numpy as np
+        bgr = [np.ascontiguousarray(f[:, :, ::-1]) for f in rgb_frames]
+        out = self.model.inference_image_list(bgr)
+        return [np.ascontiguousarray(o[:, :, ::-1]) for o in out]
+
+    def enhance(self, frame):            # single-frame path (ETA/preview)
+        return self.enhance_clip([frame])[0]
+
+
+def _vsr_stream(frames, enhance_clip, window):
+    """Feed frames to a temporal VSR model in non-overlapping windows. Frame-exact
+    (one output per input); a small discontinuity can occur at each window edge
+    (every `window` frames ~1s) — acceptable, like the segment boundaries."""
+    buf = []
+    for f in frames:
+        buf.append(f)
+        if len(buf) >= window:
+            for o in enhance_clip(buf):
+                yield o
+            buf = []
+    if buf:
+        for o in enhance_clip(buf):
+            yield o
+
+
 # ── encoder detection (ported/adapted from pi_convert.py) ─────────────────────
 def _encoder_listed(codec):
     try:
@@ -812,18 +879,23 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
                 return
             yield f
 
-    enh = upscaler.enhance
-    dedup = _DedupEnhance(enh) if job.settings.get("dedup", True) else None
-    if dedup:
-        enh = dedup
-    if interpolating and abs(fps_out - fps_in) > 1e-6:
-        interp = interpolator.interpolate
-        if order == "post":          # upscale first, interpolate at target res
-            stream = _resample((enh(f) for f in src_frames()), fps_in, fps_out, interp)
-        else:                         # pre (default): interpolate at source res, then upscale
-            stream = (enh(f) for f in _resample(src_frames(), fps_in, fps_out, interp))
+    dedup = None
+    if getattr(upscaler, "is_temporal", False):
+        # temporal VSR: windowed, no per-frame dedup (it wants real neighbours)
+        stream = _vsr_stream(src_frames(), upscaler.enhance_clip, upscaler.window)
     else:
-        stream = (enh(f) for f in src_frames())
+        enh = upscaler.enhance
+        dedup = _DedupEnhance(enh) if job.settings.get("dedup", True) else None
+        if dedup:
+            enh = dedup
+        if interpolating and abs(fps_out - fps_in) > 1e-6:
+            interp = interpolator.interpolate
+            if order == "post":       # upscale first, interpolate at target res
+                stream = _resample((enh(f) for f in src_frames()), fps_in, fps_out, interp)
+            else:                      # pre (default): interpolate at source res, then upscale
+                stream = (enh(f) for f in _resample(src_frames(), fps_in, fps_out, interp))
+        else:
+            stream = (enh(f) for f in src_frames())
 
     t0 = time.time()
     seg_frames = 0
@@ -1157,6 +1229,80 @@ def estimate_and_report(upscaler, files, settings):
     return fps
 
 
+def run_benchmark(args):
+    """Benchmark each model on a sample frame and print a comparison table, so you
+    can pick by measured speed on THIS GPU. Uses a frame from the given file (at its
+    native resolution) if provided, else a synthetic frame at --bench-res."""
+    import numpy as np
+    import torch
+
+    target = parse_target(args.target)
+    frame, label_src, total_frames = None, None, None
+    if args.inputs:
+        files = expand_inputs(args.inputs)
+        if files:
+            frame = sample_frame(files[0])
+            label_src = os.path.basename(files[0])
+            try:
+                total_frames = probe(files[0])["nb_frames"]
+            except Exception:                        # noqa: BLE001
+                pass
+    if frame is None:
+        try:
+            w, h = parse_target(args.bench_res)
+        except ValueError:
+            w, h = 1920, 1080
+        frame = (np.random.rand(h, w, 3) * 255).astype(np.uint8)
+        label_src = f"synthetic {w}x{h}"
+    h, w = frame.shape[:2]
+    if not total_frames:
+        total_frames = int(2 * 3600 * 24)           # assume a 2h @24fps movie
+        movie_note = "~2h movie"
+    else:
+        movie_note = f"{label_src}"
+
+    names = (args.bench_models.split(",") if args.bench_models
+             else list(BUILTIN_MODELS))
+    div()
+    info(f"Benchmarking {len(names)} model(s) on a {Fore.WHITE}{Style.BRIGHT}{w}x{h}"
+         f"{Style.RESET_ALL} frame ({label_src}) → {target[0]}x{target[1]}")
+    warn("Downloads any missing models; heavy models take a few seconds each.")
+    print()
+    rows = []
+    for name in names:
+        try:
+            path = resolve_model(name, args.weights_dir, assume_yes=args.yes)
+            up = Upscaler(path, gpu=args.gpu, fp16=not args.fp32, tile=args.tile)
+            for _ in range(4):                       # warmup + let GPU boost clocks ramp
+                up.enhance(frame)
+            if up.device.type == "cuda":
+                torch.cuda.synchronize()
+            t = time.time(); up.enhance(frame); t1 = time.time() - t
+            n = max(5, min(30, int(2.5 / max(t1, 1e-3))))
+            fps = benchmark_fps(up, frame, n=n, warmup=0)
+            rows.append([name, up.scale, fps, None])
+            del up
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:                       # noqa: BLE001
+            rows.append([name, None, None, str(e)[:48]])
+
+    rows.sort(key=lambda r: (r[2] is None, -(r[2] or 0)))
+    print(f"  {'model':24s} {'scale':>5s} {'fps':>7s} {'ms/fr':>7s}  {'est. ' + movie_note:>16s}")
+    print(f"  {'-'*24} {'-'*5} {'-'*7} {'-'*7}  {'-'*16}")
+    for name, scale, fps, errtxt in rows:
+        star = f" {Fore.CYAN}(default){Style.RESET_ALL}" if name == DEFAULT_MODEL else ""
+        if fps is None:
+            print(f"  {name:24s}  {Fore.RED}failed: {errtxt}{Style.RESET_ALL}")
+            continue
+        est = _fmt_long(total_frames / fps) if fps else "--"
+        col = Fore.GREEN if fps >= 5 else (Fore.YELLOW if fps >= 1 else Fore.RED)
+        print(f"  {name:24s} {('x'+str(scale)):>5s} {col}{fps:7.1f}{Style.RESET_ALL} "
+              f"{1000/fps:7.0f}  {est:>16s}{star}")
+    div()
+    return 0
+
+
 def _fmt_long(secs):
     secs = int(max(0, secs))
     d, r = divmod(secs, 86400)
@@ -1275,6 +1421,14 @@ def build_parser():
     g.add_argument("--interp-order", choices=["pre", "post"], default="pre",
                    help="pre = interpolate then upscale (fast); post = upscale then interpolate")
 
+    g = p.add_argument_group("temporal VSR (multi-frame, less flicker)")
+    g.add_argument("--vsr", action="store_true",
+                   help="use temporal video super-resolution instead of single-image")
+    g.add_argument("--vsr-model", default=DEFAULT_VSR_MODEL, choices=VSR_MODELS,
+                   help="AnimeSR_v2_4x (anime) | BasicVSR/IconVSR/EDVR (general)")
+    g.add_argument("--vsr-window", type=int, default=16,
+                   help="frames per VSR window (more = better temporal, more VRAM)")
+
     g = p.add_argument_group("encode")
     g.add_argument("--codec", default=ENC_DEFAULTS["codec"],
                    choices=["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264"])
@@ -1303,6 +1457,12 @@ def build_parser():
 
     g = p.add_argument_group("misc")
     g.add_argument("--dry-run", action="store_true", help="print plan+commands, run nothing")
+    g.add_argument("--benchmark", action="store_true",
+                   help="benchmark all models on a sample frame and print a table")
+    g.add_argument("--bench-res", default="1920x1080",
+                   help="frame size for --benchmark when no input file is given")
+    g.add_argument("--bench-models", default=None,
+                   help="comma-separated model list for --benchmark (default: all builtins)")
     g.add_argument("--no-eta", action="store_true", help="skip the upfront benchmark/ETA")
     g.add_argument("-y", "--yes", action="store_true", help="auto-confirm downloads")
     g.add_argument("--verbose", action="store_true")
@@ -1347,15 +1507,25 @@ def run_cli(args):
     _va, label = pick_encoder(settings)
     info(f"Encoder → {label}")
     # resolve + load the model once, reuse across files
-    model_path = resolve_model(args.model, args.weights_dir, assume_yes=args.yes)
-    info(f"Loading model {os.path.basename(model_path)} ...")
-    upscaler = Upscaler(model_path, gpu=args.gpu, fp16=not args.fp32,
-                        tile=args.tile, tile_pad=args.tile_pad)
-    info(f"Model ready: x{upscaler.scale}, fp16={upscaler.fp16}, "
-         f"tile={upscaler.tile}, device={upscaler.device}")
+    if args.vsr:
+        info(f"Loading temporal VSR model {args.vsr_model} ...")
+        upscaler = VSRUpscaler(args.vsr_model, gpu=args.gpu, fp16=not args.fp32,
+                               tile=(args.tile if args.tile > 0 else 128),
+                               window=args.vsr_window, weights_dir=args.weights_dir)
+        info(f"VSR ready: {upscaler.name} x{upscaler.scale}, window={upscaler.window}, "
+             f"fp16={upscaler.fp16}, device={upscaler.device}")
+    else:
+        model_path = resolve_model(args.model, args.weights_dir, assume_yes=args.yes)
+        info(f"Loading model {os.path.basename(model_path)} ...")
+        upscaler = Upscaler(model_path, gpu=args.gpu, fp16=not args.fp32,
+                            tile=args.tile, tile_pad=args.tile_pad)
+        info(f"Model ready: x{upscaler.scale}, fp16={upscaler.fp16}, "
+             f"tile={upscaler.tile}, device={upscaler.device}")
 
     interpolator = None
-    if args.interpolate:
+    if args.interpolate and args.vsr:
+        warn("--interpolate is ignored in --vsr mode (not combined yet).")
+    elif args.interpolate:
         info(f"Loading RIFE interpolation model {args.rife_model} ...")
         interpolator = Interpolator(device=upscaler.device, fp16=not args.fp32,
                                     model_name=args.rife_model,
@@ -1437,6 +1607,9 @@ def main(argv=None):
     if args.list_models:
         _print_models()
         return 0
+
+    if args.benchmark:
+        return run_benchmark(args)
 
     if args.serve:
         try:
