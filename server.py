@@ -121,7 +121,13 @@ def create_app(state):
         if not os.path.isfile(idx):
             return HTMLResponse("<h1>webui/index.html missing</h1>", status_code=500)
         with open(idx, encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+            html = f.read()
+        # cache-bust css/js by file mtime, so edits always load (no stale JS)
+        for asset in ("styles.css", "app.js"):
+            p = os.path.join(WEBUI_DIR, asset)
+            v = int(os.path.getmtime(p)) if os.path.isfile(p) else 0
+            html = html.replace(f"/static/{asset}", f"/static/{asset}?v={v}")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     if os.path.isdir(WEBUI_DIR):
         app.mount("/static", StaticFiles(directory=WEBUI_DIR), name="static")
