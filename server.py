@@ -163,7 +163,19 @@ def create_app(state):
     @app.get("/api/state")
     def api_state(request: Request, token: str = Query(None)):
         check_token(request, token)
-        return {"jobs": q.snapshot(), "current": q.current.id if q.current else None}
+        return {"jobs": q.snapshot(), "current": q.current.id if q.current else None,
+                "running": q.running}
+
+    @app.post("/api/queue/{action}")
+    def api_queue(action: str, request: Request, token: str = Query(None)):
+        check_token(request, token)
+        if action == "start":
+            q.start()
+        elif action == "pause":
+            q.pause_queue()
+        else:
+            raise HTTPException(400, f"Unknown action {action}")
+        return {"running": q.running, "jobs": q.snapshot()}
 
     @app.post("/api/jobs")
     async def api_add(request: Request, token: str = Query(None)):
@@ -255,7 +267,8 @@ def create_app(state):
         await websocket.accept()
         hub.clients.add(websocket)
         try:
-            await websocket.send_json({"type": "state", "jobs": q.snapshot()})
+            await websocket.send_json({"type": "state", "jobs": q.snapshot(),
+                                       "running": q.running})
             while True:
                 await websocket.receive_text()       # keepalive / ignore
         except WebSocketDisconnect:
@@ -271,7 +284,7 @@ def create_app(state):
         def emit(payload):
             # payload: a job dict (single-job update) or None (full-state refresh)
             if payload is None:
-                hub.push({"type": "state", "jobs": q.snapshot()})
+                hub.push({"type": "state", "jobs": q.snapshot(), "running": q.running})
             else:
                 hub.push({"type": "job", "job": payload})
         q.on_change = emit

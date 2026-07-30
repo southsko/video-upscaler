@@ -152,6 +152,21 @@ async function clearFinished() {
     state.jobs = r.jobs; renderQueue();
   } catch (e) { toast("Clear failed", e.message, "bad"); }
 }
+function updateStartBtn() {
+  const b = $("start-btn");
+  if (!b) return;
+  const active = state.jobs.some((j) => ["queued", "running", "paused"].includes(j.status));
+  b.textContent = state.running ? "⏸ Pause queue" : "▶ Start";
+  b.classList.toggle("primary", !state.running);
+  b.classList.toggle("ghost", state.running);
+  b.disabled = !active && !state.running;
+}
+async function toggleQueue() {
+  try {
+    const r = await post(`/api/queue/${state.running ? "pause" : "start"}`);
+    state.running = r.running; state.jobs = r.jobs; renderQueue(); updateStartBtn();
+  } catch (e) { toast("Queue action failed", e.message, "bad"); }
+}
 
 /* ── websocket ───────────────────────────────────────────── */
 function connectWS() {
@@ -159,7 +174,7 @@ function connectWS() {
   const ws = new WebSocket(`${proto}://${location.host}/ws${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`);
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === "state") { state.jobs = msg.jobs; renderQueue(); }
+    if (msg.type === "state") { state.jobs = msg.jobs; if (msg.running !== undefined) state.running = msg.running; renderQueue(); updateStartBtn(); }
     else if (msg.type === "job") { upsertJob(msg.job); }
   };
   ws.onclose = () => setTimeout(connectWS, 1500);
@@ -344,6 +359,7 @@ function humanSize(n) {
 function wire() {
   $("add-btn").onclick = openBrowser;
   $("clear-btn").onclick = clearFinished;
+  $("start-btn").onclick = toggleQueue;
   $("browser-close").onclick = closeBrowser;
   $("overlay").onclick = closeBrowser;
   $("add-selected-btn").onclick = () => addPaths([...selected]);
@@ -366,7 +382,7 @@ async function boot() {
   wire();
   try { await loadInfo(); } catch (e) { toast("Backend error", e.message, "bad"); }
   try { await loadModels(); } catch (e) { /* torch-less still ok */ }
-  try { state.jobs = (await api("/api/state")).jobs; renderQueue(); } catch (e) {}
+  try { const s = await api("/api/state"); state.jobs = s.jobs; state.running = s.running; renderQueue(); updateStartBtn(); } catch (e) {}
   connectWS();
 }
 document.addEventListener("DOMContentLoaded", boot);

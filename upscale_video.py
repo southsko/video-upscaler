@@ -1181,6 +1181,7 @@ class JobQueue:
         self._interps = {}         # cache-key -> Interpolator
         self.on_change = None      # callback(job_dict or None) for broadcasts
         self.current = None
+        self.running = False       # queue does NOT auto-run; user presses Start
         self._load()
 
     def _load(self):
@@ -1204,16 +1205,31 @@ class JobQueue:
                 self.jobs.append(job)
             except (KeyError, TypeError):
                 continue
-        if any(j.status == "queued" for j in self.jobs):
-            self._ensure_worker()
+        # restored jobs wait — do NOT auto-run on startup; user presses Start.
 
     def add(self, src, settings):
         job = Job(src, settings)
         with self._lock:
             self.jobs.append(job)
         self._changed(job)
-        self._ensure_worker()
+        if self.running:               # only auto-pick if the queue is started
+            self._ensure_worker()
         return job
+
+    def start(self):
+        """Begin processing queued jobs."""
+        self.running = True
+        if self.current and self.current.status == "paused":
+            self.current.resume()
+        self._ensure_worker()
+        self._changed(None)
+
+    def pause_queue(self):
+        """Stop picking up new jobs (a running job also pauses via job.pause)."""
+        self.running = False
+        if self.current:
+            self.current.pause()
+        self._changed(None)
 
     def get(self, job_id):
         return next((j for j in self.jobs if j.id == job_id), None)
@@ -1243,6 +1259,8 @@ class JobQueue:
 
     def _run_loop(self):
         while not self._stop.is_set():
+            if not self.running:
+                return
             job = next((j for j in self.jobs if j.status == "queued"), None)
             if job is None:
                 return
