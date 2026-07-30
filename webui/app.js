@@ -72,6 +72,17 @@ function updateModelNote() {
   $("model-note").textContent = m ? m.note + (m.cached ? "" : " — downloads on first use") : "";
 }
 
+function applyPreset(name) {
+  const p = (state.info && state.info.presets || {})[name];
+  if (!p) return;
+  $("model").value = p.model; updateModelNote();
+  $("qp").value = p.qp;
+  $("codec").value = p.codec;
+  document.querySelectorAll("#preset-seg button").forEach(
+    (b) => b.classList.toggle("active", b.dataset.v === name));
+  $("preset-note").textContent = p.label;
+}
+
 /* ── queue rendering ─────────────────────────────────────── */
 function renderQueue() {
   const box = $("queue");
@@ -340,6 +351,8 @@ function wire() {
   $("preview-btn").onclick = runPreview;
   $("model").onchange = updateModelNote;
   $("bench-btn").onclick = runBenchmark;
+  document.querySelectorAll("#preset-seg button").forEach(
+    (b) => b.onclick = () => applyPreset(b.dataset.v));
   $("interpolate").onchange = (e) => $("fps-field").style.display = e.target.checked ? "" : "none";
   document.querySelectorAll("#target-seg button").forEach((b) =>
     b.onclick = () => {

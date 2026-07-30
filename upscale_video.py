@@ -115,6 +115,19 @@ ENC_DEFAULTS = {
     "gop": "30", "bf": "0",
 }
 
+# One-click quality/speed bundles (model + encode). Labels shown in --list-presets
+# and the web UI so the model/speed tradeoff is explicit (no content guessing).
+QUALITY_PRESETS = {
+    "fast":     {"model": "realesr-animevideov3", "qp": "19", "codec": "h264_nvenc",
+                 "label": "Fastest — anime/cartoon model, H.264"},
+    "balanced": {"model": "2x-nomos-span", "qp": "17", "codec": "h264_nvenc",
+                 "label": "Balanced — fast live-action SPAN model, H.264 (recommended)"},
+    "best":     {"model": "2x-nomos-span", "qp": "14", "codec": "hevc_nvenc",
+                 "label": "Best — same fast model, higher-quality HEVC encode"},
+    "max":      {"model": "realesrgan-x4plus", "qp": "13", "codec": "hevc_nvenc",
+                 "label": "Max detail — heavy model, VERY slow (~days/movie)"},
+}
+
 DEFAULT_PORT = int(os.environ.get("UPSCALE_PORT", "8848"))
 DEFAULT_SEGMENT_SECONDS = int(os.environ.get("UPSCALE_SEGMENT_SECONDS", "300"))
 
@@ -1568,6 +1581,8 @@ def build_parser():
                    help="do NOT tonemap HDR->SDR (HDR sources will look washed out)")
 
     g = p.add_argument_group("model")
+    g.add_argument("--quality", choices=list(QUALITY_PRESETS),
+                   help="one-click bundle of model+qp+codec (fast|balanced|best|max)")
     g.add_argument("--model", default=DEFAULT_MODEL,
                    help="builtin name | local file | HF id (see --list-models)")
     g.add_argument("--denoise", type=float, default=None, help="0..1 (models that support it)")
@@ -1793,6 +1808,11 @@ def main(argv=None):
 
     if args.setup:
         return do_setup(args)
+
+    if args.quality:                                 # apply the preset bundle
+        preset = QUALITY_PRESETS[args.quality]
+        args.model, args.qp, args.codec = preset["model"], preset["qp"], preset["codec"]
+        info(f"Quality preset '{args.quality}': {preset['label']}")
 
     if args.list_models:
         _print_models()

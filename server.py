@@ -142,6 +142,7 @@ def create_app(state):
             "default_model": U.DEFAULT_MODEL,
             "targets": list(U.TARGET_PRESETS.keys()),
             "codecs": ["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264"],
+            "presets": {k: v for k, v in U.QUALITY_PRESETS.items()},
             "torch": _torch_ok(),
             "weights_dir": U.DEFAULT_WEIGHTS_DIR,
         }
