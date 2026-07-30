@@ -114,10 +114,16 @@ rawvideo → GPU (interpolate?→upscale) → rawvideo into an NVENC ffmpeg that
 scale+pad to the exact target → `up_%04d.mkv`; concat (`-c copy`) → mux audio/subs from the original.
 
 ## 5. Current state — DONE & verified on the RTX 3080
-Upscale (480p→4K, 1080p→4K on real film), audio/subs preserved, videoai metadata; segmentation +
-concat; resume across restarts; RIFE interpolation (2× and non-integer, e.g. 30→45); web UI (file
-browser, live queue, before/after slider, persistence, clear/remove); auto-tile; upfront ETA;
-lossless dup-frame dedup. All committed & pushed.
+**Engine:** upscale (480p→4K, 1080p→4K on real film), audio/subs preserved, metadata; segmentation +
+concat; resume across restarts; RIFE interpolation (2× and non-integer); temporal VSR (`--vsr`, ccrestoration
+AnimeSR/BasicVSR/IconVSR/EDVR, fp32); external/diffusion seam (`--external-cmd`, SeedVR2 path); auto-tile;
+upfront ETA; lossless dup-frame dedup; per-model `--benchmark`; quality presets (`--quality`).
+**Real-media (auto-detected):** HDR/10-bit → tonemap to SDR; interlaced → yadif; VFR → CFR-at-avg + warn;
+**anamorphic → un-squeeze to display aspect** (DVD/VOB/3gp not distorted). 30+ input extensions.
+**Web UI:** file browser, **Start/Pause/Stop queue control (no auto-run on add)**, live queue + WebSocket
+progress, before/after **zoom-crop** preview, ⚡ Benchmark button, **quality-preset buttons**, **output-folder
+Browse button**, model dropdown, persistence, clear/remove, cache-busted assets, localhost+token security.
+**Foundation:** 31 pytest tests (pure logic), pyproject `upscale-video` entry point. All committed & pushed.
 
 ## 6. Key measured findings (RTX 3080) — IMPORTANT
 - Pipeline is **GPU-compute-bound and already well-overlapped** (~30 fps end-to-end at 480p→4K =
@@ -160,15 +166,23 @@ lossless dup-frame dedup. All committed & pushed.
   Some films are 2160p HDR (good for the 10-bit/HDR TODO).
 - Scratch/tmp lives under `%TEMP%\upscale_scratch`. Downloaded model weights cache in `models/`.
 
-## 9. TODO — prioritized roadmap (🔴 high / 🟡 med / ⚪ low)
-**Speed/efficiency**
-1. ✅ DONE — added fast SPAN/Compact builtins (`2x-nomos-span` etc.); live-action now practical.
-2. 🟡 **Content-aware model auto-select** (`--model auto`): the hard part is detecting anime vs
-   live-action (can't be done from scale alone — my scale-based idea was wrong). Consider a cheap
-   heuristic (edge/palette stats) or just a UI hint. Lower priority than I first thought.
-3. ✅ DONE — models labelled by speed/content in `--list-models` and notes.
-4. 🟡 `--dedup-threshold` for near-duplicate frames (exact-match barely triggers on lossy video).
-5. ⚪ Surface the ETA in the web UI (currently CLI only).
+## 9. TODO — what's LEFT (🔴 high / 🟡 med / ⚪ low)  [much of the original roadmap is now DONE — see §5]
+**Biggest remaining item**
+- 🔴 **Finish tier-3 SeedVR2 diffusion** on the 24 GB box (see §0 + the "What's LEFT to finish tier 3"
+  checklist above) — the `--external-cmd` seam is built; SeedVR2 itself needs installing + wiring there.
+
+**Web UI polish (CLI-only features not yet in the dashboard)**
+- 🟡 Expose **`--vsr` temporal toggle**, **`--external-cmd`**, and **upfront ETA** in the web UI.
+- 🟡 **Model manager** panel (browse/download/see-cached, add HF/OpenModelDB ids with progress).
+- 🟡 Show detected **source flags** (HDR/interlaced/VFR/anamorphic badges) when a file is picked.
+
+**Engine niceties**
+- 🟡 **Format robustness** (from the formats plan): split to a robust intermediate (.mkv/.ts) for exotic
+  containers that don't `-c copy` segment cleanly; **audio/sub mux fallback** (re-encode to AAC when copy
+  fails, e.g. RealAudio). Anamorphic + extensions are already done.
+- 🟡 `--dedup-threshold` for near-duplicate frames (exact-match barely triggers on lossy video).
+- ⚪ Content-aware `--model auto` (needs anime-vs-live detection — hard; a UI hint may be enough).
+- ⚪ 10-bit HEVC encode option (p010) to cut banding; ⚪ temporal-VSR fp16 (upstream ccrestoration bug).
 
 **Real-media correctness**
 6. 🔴 **VFR**: detect variable frame rate, preserve timestamps (avoid A/V drift from `-r` re-timing).
