@@ -1,5 +1,11 @@
 # Video Upscaler — Developer Handoff
 
+> **▶ RESUMING? START HERE.** Read this whole file + `README.md`, then run `python -m pytest` to
+> confirm the engine works. Env + architecture + gotchas + what's left are all below. Dev box is a
+> 10 GB RTX 3080; the owner's other machine is 24 GB (tier-3 diffusion needs that one). `git push`
+> works over SSH; **`git push --force` is blocked** — you'll be handed the command to run. When you
+> finish work, update this file and commit it so the next session stays accurate.
+
 Self-contained context so a fresh session (any model) can continue without prior history.
 
 ## 0. North star (long-term direction — decided with the owner)
