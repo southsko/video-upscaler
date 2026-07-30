@@ -152,6 +152,32 @@ def test_external_args_paths_with_spaces():
                     "--out", r"D:\out\up 0.mkv", "--res", "3840x2160"]
 
 
+# ── real-media detection / decode flags ──────────────────────────────────────
+def test_decode_flags_hdr_and_interlaced():
+    hdr = {"is_hdr": True, "is_interlaced": False}
+    assert U._decode_flags(hdr, {}) == (False, True)               # auto-tonemap HDR
+    assert U._decode_flags(hdr, {"tonemap": False}) == (False, False)  # --no-tonemap
+    il = {"is_hdr": False, "is_interlaced": True}
+    assert U._decode_flags(il, {}) == (True, False)                # auto-deinterlace
+    assert U._decode_flags(il, {"deinterlace": "off"}) == (False, False)
+    assert U._decode_flags({"is_hdr": False, "is_interlaced": False},
+                           {"deinterlace": "on"}) == (True, False)  # forced on
+
+
+def test_describe_source():
+    assert U.describe_source({"bit_depth": 8, "is_hdr": False,
+                              "is_interlaced": False, "is_vfr": False}) == "8-bit"
+    s = U.describe_source({"bit_depth": 10, "is_hdr": True, "color_transfer": "smpte2084",
+                           "is_interlaced": True, "field_order": "tb", "is_vfr": True})
+    assert "10-bit" in s and "HDR" in s and "interlaced" in s and "VFR" in s
+
+
+def test_decode_cmd_has_tonemap_and_yadif():
+    cmd = " ".join(U.build_decode_cmd("in.mkv", deinterlace=True, tonemap=True))
+    assert "yadif" in cmd and "tonemap" in cmd and "gbrpf32le" in cmd
+    assert "-vf" not in " ".join(U.build_decode_cmd("in.mkv"))   # no filter when clean
+
+
 # ── time formatting ──────────────────────────────────────────────────────────
 def test_fmt():
     assert U._fmt(65) == "1:05"

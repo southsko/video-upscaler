@@ -185,6 +185,12 @@ Takeaways:
 - **Persistent web queue:** jobs are saved to `jobs.json` and restored on restart — unfinished jobs
   re-queue (and resume), done/failed stay as history until you *Clear finished*; jobs whose source
   has moved are dropped.
+- **Real-media handling (auto-detected from the source):**
+  - **HDR / 10-bit** (PQ/HLG, bt2020) → tonemapped to SDR before upscaling, since the AI models are
+    SDR-domain (output is SDR bt709). Disable with `--no-tonemap` (HDR will then look washed out).
+  - **Interlaced** → deinterlaced (yadif). Control with `--deinterlace auto|on|off` (default auto).
+  - **VFR** (variable frame rate) → output is constant-fps at the average rate; audio stays aligned
+    at the ends. `--dry-run` prints all detected flags (bit depth, HDR, interlaced, VFR).
 - **Models** download on first use (with a confirmation) into `--weights-dir` and are cached.
 - **Interpolation** (`--interpolate`) uses RIFE via [`ccvfi`](https://pypi.org/project/ccvfi/)
   (weights auto-download). `--interp-order pre` (default) interpolates at source res then upscales

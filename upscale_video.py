@@ -194,6 +194,17 @@ def probe(path):
         nb_frames = int(nb)
     except (TypeError, ValueError):
         nb_frames = int(round(fps * dur)) if (fps and dur) else 0
+
+    pix_fmt = v.get("pix_fmt", "yuv420p")
+    bit_depth = 10 if any(t in pix_fmt for t in ("10le", "10be", "p010", "p210")) \
+        else (12 if "12" in pix_fmt else 8)
+    trc = (v.get("color_transfer") or "").lower()
+    prim = (v.get("color_primaries") or "").lower()
+    is_hdr = trc in ("smpte2084", "arib-std-b67") or prim == "bt2020"
+    field_order = (v.get("field_order") or "progressive").lower()
+    is_interlaced = field_order in ("tt", "bb", "tb", "bt")
+    r_fps = _rat(v.get("r_frame_rate"))
+    is_vfr = bool(fps and r_fps and abs(r_fps - fps) / fps > 0.02)
     return {
         "path": path,
         "width": int(v.get("width", 0)),
@@ -201,11 +212,29 @@ def probe(path):
         "fps": fps,
         "duration": dur,
         "nb_frames": nb_frames,
-        "pix_fmt": v.get("pix_fmt", "yuv420p"),
+        "pix_fmt": pix_fmt,
         "vcodec": v.get("codec_name", "?"),
         "has_audio": has_audio,
         "has_subs": has_subs,
+        "bit_depth": bit_depth,
+        "color_transfer": trc,
+        "is_hdr": is_hdr,
+        "field_order": field_order,
+        "is_interlaced": is_interlaced,
+        "is_vfr": is_vfr,
     }
+
+
+def describe_source(meta):
+    """Short human summary of source flags for logs / dry-run / UI."""
+    tags = [f"{meta['bit_depth']}-bit"]
+    if meta.get("is_hdr"):
+        tags.append(f"HDR({meta.get('color_transfer') or 'bt2020'})")
+    if meta.get("is_interlaced"):
+        tags.append(f"interlaced({meta['field_order']})")
+    if meta.get("is_vfr"):
+        tags.append("VFR")
+    return ", ".join(tags)
 
 
 # ── target / scale math ───────────────────────────────────────────────────────
@@ -629,13 +658,32 @@ def default_output_path(src, settings):
 
 
 # ── pipeline: commands ────────────────────────────────────────────────────────
-def build_decode_cmd(src, hwaccel=False):
-    """Decode a whole file to rgb24 rawvideo on stdout."""
+def build_decode_cmd(src, hwaccel=False, deinterlace=False, tonemap=False,
+                     hdr_transfer="smpte2084"):
+    """Decode a whole file to 8-bit rgb24 rawvideo on stdout, with optional
+    deinterlace (yadif) and HDR->SDR tonemap (zscale+tonemap) so the SDR-trained
+    SR models get correct input. `tonemap` truthy enables it; hdr_transfer selects
+    PQ (smpte2084) vs HLG (arib-std-b67). Input colour is declared explicitly so
+    it works even if the stream's VUI tags are missing."""
     pre = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
     if hwaccel:
         pre += ['-hwaccel', 'cuda']
-    return pre + ['-i', src, '-an', '-sn', '-map', '0:v:0',
-                  '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
+    filters = []
+    if deinterlace:
+        filters.append('yadif=deint=interlaced')
+    if tonemap:
+        tin = "arib-std-b67" if hdr_transfer == "arib-std-b67" else "smpte2084"
+        # canonical zscale tonemap: linearize -> float gbr -> bt709 primaries ->
+        # tonemap -> bt709 SDR. The float step is required (else "no path between
+        # colorspaces"). Input colour declared explicitly for robustness.
+        filters.append(
+            f'zscale=transferin={tin}:primariesin=bt2020:matrixin=bt2020nc:'
+            'transfer=linear:npl=100,format=gbrpf32le,zscale=primaries=bt709,'
+            'tonemap=tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:range=tv')
+    cmd = pre + ['-i', src, '-an', '-sn', '-map', '0:v:0']
+    if filters:
+        cmd += ['-vf', ",".join(filters)]
+    return cmd + ['-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
 
 
 def build_encode_cmd(up_w, up_h, fps, target_w, target_h, out_path, video_args,
@@ -814,6 +862,14 @@ class _DedupEnhance:
         return self.prev_out
 
 
+def _decode_flags(meta, settings):
+    """(deinterlace, tonemap) from source flags + settings."""
+    di = settings.get("deinterlace", "auto")
+    deint = (di == "on") or (di == "auto" and meta.get("is_interlaced"))
+    tonemap = bool(meta.get("is_hdr") and settings.get("tonemap", True))
+    return deint, tonemap
+
+
 def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
                      video_args, out_seg, on_progress, interpolator=None):
     """Stream one source-segment file: decode -> (interpolate) -> GPU upscale ->
@@ -828,9 +884,12 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
     tw, th = target
     pad = job.settings.get("pad", True)
     pad_color = job.settings.get("pad_color", "black")
+    deint, tonemap = _decode_flags(info_meta, job.settings)
 
-    dec = subprocess.Popen(build_decode_cmd(src_seg), stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL)
+    dec = subprocess.Popen(
+        build_decode_cmd(src_seg, deinterlace=deint, tonemap=tonemap,
+                         hdr_transfer=info_meta.get("color_transfer") or "smpte2084"),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     enc = subprocess.Popen(
         build_encode_cmd(up_w, up_h, fps_out, tw, th, out_seg, video_args,
                          pad_color=pad_color, pad=pad),
@@ -965,8 +1024,22 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
     try:
         meta = probe(job.src)
         job.meta = {k: meta[k] for k in ("width", "height", "fps", "duration",
-                                         "nb_frames", "has_audio", "has_subs")}
+                                         "nb_frames", "has_audio", "has_subs",
+                                         "bit_depth", "is_hdr", "is_interlaced", "is_vfr")}
         job.total_frames = meta["nb_frames"] or 1
+        if not job.settings.get("external_cmd"):
+            _di, _tm = _decode_flags(meta, job.settings)
+            if meta.get("is_hdr"):
+                if _tm:
+                    info(f"  HDR source ({meta.get('color_transfer') or 'bt2020'}) → "
+                         f"tonemapping to SDR (AI models are SDR-domain)")
+                else:
+                    warn("  HDR source but --no-tonemap set — colors will look washed out.")
+            if _di:
+                info("  interlaced source → deinterlacing (yadif)")
+            if meta.get("is_vfr"):
+                warn("  variable frame rate → output is constant-fps at the average rate "
+                     f"({meta['fps']:.3f}); audio stays aligned at the ends.")
         if interpolator:
             fps_in = meta["fps"] or 30.0
             fps_out = float(job.settings.get("fps") or 0) or fps_in * 2
@@ -1415,6 +1488,10 @@ def plan_and_print(src, settings):
     info(f"DRY RUN — {os.path.basename(src)}")
     print(f"  source     : {meta['width']}x{meta['height']} @ {meta['fps']:.3f}fps, "
           f"{_fmt(meta['duration'])}, {meta['nb_frames']} frames, {meta['vcodec']}")
+    print(f"  format     : {describe_source(meta)}")
+    _di, _tm = _decode_flags(meta, settings)
+    if _di or _tm:
+        print(f"  pre-filter : {'deinterlace ' if _di else ''}{'HDR→SDR tonemap' if _tm else ''}".strip())
     print(f"  model      : {model_spec}  (native x{scale})")
     print(f"  model out  : {up_w}x{up_h}  ->  target {target[0]}x{target[1]} (lanczos+pad)")
     print(f"  encoder    : {label}")
@@ -1449,6 +1526,7 @@ def _settings_from_args(a):
         "aq_strength": a.aq_strength, "extra_enc": a.extra_enc,
         "container": a.container, "suffix": a.suffix, "output_dir": a.output,
         "overwrite": a.overwrite, "pad": not a.no_pad, "pad_color": a.pad_color,
+        "deinterlace": a.deinterlace, "tonemap": not a.no_tonemap,
         "tile": a.tile, "tile_pad": a.tile_pad, "fp16": not a.fp32, "gpu": a.gpu,
         "denoise": a.denoise, "weights_dir": a.weights_dir,
         "dedup": not a.no_dedup, "external_cmd": a.external_cmd,
@@ -1482,6 +1560,12 @@ def build_parser():
     g.add_argument("--target", default="4k", help="4k | 1080p | WxH (default 4k)")
     g.add_argument("--no-pad", action="store_true", help="crop-to-fill instead of pad")
     g.add_argument("--pad-color", default="black")
+
+    g = p.add_argument_group("source handling")
+    g.add_argument("--deinterlace", choices=["auto", "on", "off"], default="auto",
+                   help="deinterlace interlaced sources (auto = only if detected)")
+    g.add_argument("--no-tonemap", action="store_true",
+                   help="do NOT tonemap HDR->SDR (HDR sources will look washed out)")
 
     g = p.add_argument_group("model")
     g.add_argument("--model", default=DEFAULT_MODEL,
