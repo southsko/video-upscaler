@@ -65,10 +65,15 @@ def div():    print(f"{Fore.BLUE}{Style.BRIGHT}{'-' * 62}{Style.RESET_ALL}")
 
 
 # ── constants / config (env-overridable) ──────────────────────────────────────
-VIDEO_EXTENSIONS = ['*.mp4', '*.mov', '*.avi', '*.mkv', '*.m4v', '*.webm',
-                    '*.flv', '*.wmv', '*.ts', '*.mpg', '*.mpeg', '*.m2ts',
-                    '*.MP4', '*.MOV', '*.AVI', '*.MKV']
-_VIDEO_EXTS = {os.path.splitext(p)[1].lower() for p in VIDEO_EXTENSIONS}
+# Extensions used for FOLDER scans + the web file browser. (Files passed directly
+# by path are attempted regardless of extension — ffmpeg decodes far more than this.)
+_VIDEO_EXTS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm", ".flv", ".wmv", ".ts",
+    ".mpg", ".mpeg", ".mpe", ".m2ts", ".mts", ".m2v", ".m1v", ".mpv",
+    ".3gp", ".3g2", ".ogv", ".ogm", ".vob", ".divx", ".asf", ".rm", ".rmvb",
+    ".mxf", ".y4m", ".f4v", ".dv", ".nut", ".qt",
+}
+VIDEO_EXTENSIONS = [f"*{e}" for e in sorted(_VIDEO_EXTS)]   # glob patterns (case-insensitive FS)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_WEIGHTS_DIR = os.environ.get("UPSCALE_WEIGHTS_DIR", os.path.join(HERE, "models"))
@@ -218,10 +223,25 @@ def probe(path):
     is_interlaced = field_order in ("tt", "bb", "tb", "bt")
     r_fps = _rat(v.get("r_frame_rate"))
     is_vfr = bool(fps and r_fps and abs(r_fps - fps) / fps > 0.02)
+
+    width, height = int(v.get("width", 0)), int(v.get("height", 0))
+    disp_w, disp_h = width, height          # display (square-pixel) dimensions
+    try:                                    # anamorphic (non-square pixels): DVD/VOB/3gp
+        sn, sd = (v.get("sample_aspect_ratio") or "1:1").split(":")
+        sn, sd = int(sn), int(sd)
+        if sn > 0 and sd > 0 and sn != sd:
+            disp_w = int(round(width * sn / sd))   # correct horizontal stretch
+            disp_w -= disp_w % 2                     # keep even for encoders
+    except (ValueError, AttributeError, TypeError):
+        pass
+    is_anamorphic = (disp_w, disp_h) != (width, height)
     return {
         "path": path,
-        "width": int(v.get("width", 0)),
-        "height": int(v.get("height", 0)),
+        "width": width,
+        "height": height,
+        "disp_w": disp_w,
+        "disp_h": disp_h,
+        "is_anamorphic": is_anamorphic,
         "fps": fps,
         "duration": dur,
         "nb_frames": nb_frames,
@@ -247,6 +267,8 @@ def describe_source(meta):
         tags.append(f"interlaced({meta['field_order']})")
     if meta.get("is_vfr"):
         tags.append("VFR")
+    if meta.get("is_anamorphic"):
+        tags.append(f"anamorphic→{meta['disp_w']}x{meta['disp_h']}")
     return ", ".join(tags)
 
 
@@ -672,7 +694,7 @@ def default_output_path(src, settings):
 
 # ── pipeline: commands ────────────────────────────────────────────────────────
 def build_decode_cmd(src, hwaccel=False, deinterlace=False, tonemap=False,
-                     hdr_transfer="smpte2084"):
+                     hdr_transfer="smpte2084", scale_to=None):
     """Decode a whole file to 8-bit rgb24 rawvideo on stdout, with optional
     deinterlace (yadif) and HDR->SDR tonemap (zscale+tonemap) so the SDR-trained
     SR models get correct input. `tonemap` truthy enables it; hdr_transfer selects
@@ -682,18 +704,20 @@ def build_decode_cmd(src, hwaccel=False, deinterlace=False, tonemap=False,
     if hwaccel:
         pre += ['-hwaccel', 'cuda']
     cmd = pre + ['-i', src, '-an', '-sn', '-map', '0:v:0']
-    vf = source_vf(deinterlace, tonemap, hdr_transfer)
+    vf = source_vf(deinterlace, tonemap, hdr_transfer, scale_to)
     if vf:
         cmd += ['-vf', vf]
     return cmd + ['-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
 
 
-def source_vf(deinterlace=False, tonemap=False, hdr_transfer="smpte2084"):
-    """The decode-side filter chain (deinterlace + HDR->SDR tonemap), or None.
-    Shared by the streaming decode and the preview so they match."""
+def source_vf(deinterlace=False, tonemap=False, hdr_transfer="smpte2084", scale_to=None):
+    """The decode-side filter chain (deinterlace + anamorphic un-squeeze + HDR->SDR
+    tonemap), or None. Shared by the streaming decode and the preview so they match."""
     filters = []
     if deinterlace:
         filters.append('yadif=deint=interlaced')
+    if scale_to:                            # un-squeeze anamorphic to square pixels
+        filters.append(f'scale={scale_to[0]}:{scale_to[1]}:flags=lanczos,setsar=1')
     if tonemap:
         tin = "arib-std-b67" if hdr_transfer == "arib-std-b67" else "smpte2084"
         # canonical zscale tonemap: linearize -> float gbr -> bt709 primaries ->
@@ -895,7 +919,9 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
     """Stream one source-segment file: decode -> (interpolate) -> GPU upscale ->
     encode. Threaded so decode-read and encode-write overlap GPU inference."""
     import numpy as np
-    src_w, src_h = info_meta["width"], info_meta["height"]
+    # display (square-pixel) dims — the decode un-squeezes anamorphic sources to these
+    src_w = info_meta.get("disp_w") or info_meta["width"]
+    src_h = info_meta.get("disp_h") or info_meta["height"]
     frame_bytes = src_w * src_h * 3
     fps_in = info_meta["fps"] or 30.0
     interpolating = bool(interpolator)
@@ -905,10 +931,12 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
     pad = job.settings.get("pad", True)
     pad_color = job.settings.get("pad_color", "black")
     deint, tonemap = _decode_flags(info_meta, job.settings)
+    scale_to = (src_w, src_h) if info_meta.get("is_anamorphic") else None
 
     dec = subprocess.Popen(
         build_decode_cmd(src_seg, deinterlace=deint, tonemap=tonemap,
-                         hdr_transfer=info_meta.get("color_transfer") or "smpte2084"),
+                         hdr_transfer=info_meta.get("color_transfer") or "smpte2084",
+                         scale_to=scale_to),
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     enc = subprocess.Popen(
         build_encode_cmd(up_w, up_h, fps_out, tw, th, out_seg, video_args,
@@ -1045,7 +1073,8 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
         meta = probe(job.src)
         job.meta = {k: meta[k] for k in ("width", "height", "fps", "duration",
                                          "nb_frames", "has_audio", "has_subs",
-                                         "bit_depth", "is_hdr", "is_interlaced", "is_vfr")}
+                                         "bit_depth", "is_hdr", "is_interlaced", "is_vfr",
+                                         "is_anamorphic", "disp_w", "disp_h")}
         job.total_frames = meta["nb_frames"] or 1
         if not job.settings.get("external_cmd"):
             _di, _tm = _decode_flags(meta, job.settings)
@@ -1060,6 +1089,9 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
             if meta.get("is_vfr"):
                 warn("  variable frame rate → output is constant-fps at the average rate "
                      f"({meta['fps']:.3f}); audio stays aligned at the ends.")
+            if meta.get("is_anamorphic"):
+                info(f"  anamorphic source ({meta['width']}x{meta['height']}) → "
+                     f"un-squeezing to {meta['disp_w']}x{meta['disp_h']} (correct aspect)")
         if interpolator:
             fps_in = meta["fps"] or 30.0
             fps_out = float(job.settings.get("fps") or 0) or fps_in * 2
@@ -1071,7 +1103,9 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
             scale = up_w = up_h = video_args = None
         else:
             scale = upscaler.scale
-            up_w, up_h = model_output_dims(meta["width"], meta["height"], scale)
+            sw = meta.get("disp_w") or meta["width"]
+            sh = meta.get("disp_h") or meta["height"]
+            up_w, up_h = model_output_dims(sw, sh, scale)
             video_args, _label = pick_encoder(job.settings)
 
         scratch = _scratch_dir(job, job.settings.get("scratch"))
@@ -1225,10 +1259,18 @@ class JobQueue:
         self._changed(None)
 
     def pause_queue(self):
-        """Stop picking up new jobs (a running job also pauses via job.pause)."""
+        """Suspend: stop picking up new jobs and pause the current one (resumable)."""
         self.running = False
         if self.current:
             self.current.pause()
+        self._changed(None)
+
+    def stop(self):
+        """Halt: cancel the current job and stop the queue (not resumable — the
+        job's finished segments are kept, so re-running it resumes from there)."""
+        self.running = False
+        if self.current:
+            self.current.cancel()
         self._changed(None)
 
     def get(self, job_id):
@@ -1514,7 +1556,8 @@ def plan_and_print(src, settings):
     # scale is model-native; without loading torch we look it up for builtins.
     model_spec = settings.get("model", DEFAULT_MODEL)
     scale = BUILTIN_MODELS.get(model_spec, (None, 4, None))[1]
-    up_w, up_h = model_output_dims(meta["width"], meta["height"], scale)
+    up_w, up_h = model_output_dims(meta.get("disp_w") or meta["width"],
+                                   meta.get("disp_h") or meta["height"], scale)
     target = parse_target(settings.get("target", "4k"))
     video_args, label = pick_encoder(settings)
     seg_seconds = settings.get("segment_seconds", DEFAULT_SEGMENT_SECONDS)

@@ -173,6 +173,8 @@ def create_app(state):
             q.start()
         elif action == "pause":
             q.pause_queue()
+        elif action == "stop":
+            q.stop()
         else:
             raise HTTPException(400, f"Unknown action {action}")
         return {"running": q.running, "jobs": q.snapshot()}

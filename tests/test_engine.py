@@ -178,6 +178,16 @@ def test_decode_cmd_has_tonemap_and_yadif():
     assert "-vf" not in " ".join(U.build_decode_cmd("in.mkv"))   # no filter when clean
 
 
+def test_anamorphic_unsqueeze_in_decode():
+    cmd = " ".join(U.build_decode_cmd("in.mkv", scale_to=(853, 480)))
+    assert "scale=853:480" in cmd and "setsar=1" in cmd
+
+
+def test_extended_extensions():
+    for e in (".3gp", ".vob", ".ogv", ".rmvb", ".mxf", ".wmv"):
+        assert e in U._VIDEO_EXTS
+
+
 # ── time formatting ──────────────────────────────────────────────────────────
 def test_fmt():
     assert U._fmt(65) == "1:05"

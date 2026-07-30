@@ -153,17 +153,18 @@ async function clearFinished() {
   } catch (e) { toast("Clear failed", e.message, "bad"); }
 }
 function updateStartBtn() {
-  const b = $("start-btn");
+  const b = $("start-btn"), s = $("stop-btn");
   if (!b) return;
   const active = state.jobs.some((j) => ["queued", "running", "paused"].includes(j.status));
   b.textContent = state.running ? "⏸ Pause queue" : "▶ Start";
   b.classList.toggle("primary", !state.running);
   b.classList.toggle("ghost", state.running);
   b.disabled = !active && !state.running;
+  if (s) s.style.display = state.running ? "" : "none";   // Stop only while running
 }
-async function toggleQueue() {
+async function queueAction(action) {
   try {
-    const r = await post(`/api/queue/${state.running ? "pause" : "start"}`);
+    const r = await post(`/api/queue/${action}`);
     state.running = r.running; state.jobs = r.jobs; renderQueue(); updateStartBtn();
   } catch (e) { toast("Queue action failed", e.message, "bad"); }
 }
@@ -359,7 +360,8 @@ function humanSize(n) {
 function wire() {
   $("add-btn").onclick = openBrowser;
   $("clear-btn").onclick = clearFinished;
-  $("start-btn").onclick = toggleQueue;
+  $("start-btn").onclick = () => queueAction(state.running ? "pause" : "start");
+  $("stop-btn").onclick = () => queueAction("stop");
   $("browser-close").onclick = closeBrowser;
   $("overlay").onclick = closeBrowser;
   $("add-selected-btn").onclick = () => addPaths([...selected]);
