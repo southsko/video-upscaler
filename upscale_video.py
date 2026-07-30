@@ -681,6 +681,16 @@ def build_decode_cmd(src, hwaccel=False, deinterlace=False, tonemap=False,
     pre = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
     if hwaccel:
         pre += ['-hwaccel', 'cuda']
+    cmd = pre + ['-i', src, '-an', '-sn', '-map', '0:v:0']
+    vf = source_vf(deinterlace, tonemap, hdr_transfer)
+    if vf:
+        cmd += ['-vf', vf]
+    return cmd + ['-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
+
+
+def source_vf(deinterlace=False, tonemap=False, hdr_transfer="smpte2084"):
+    """The decode-side filter chain (deinterlace + HDR->SDR tonemap), or None.
+    Shared by the streaming decode and the preview so they match."""
     filters = []
     if deinterlace:
         filters.append('yadif=deint=interlaced')
@@ -693,10 +703,7 @@ def build_decode_cmd(src, hwaccel=False, deinterlace=False, tonemap=False,
             f'zscale=transferin={tin}:primariesin=bt2020:matrixin=bt2020nc:'
             'transfer=linear:npl=100,format=gbrpf32le,zscale=primaries=bt709,'
             'tonemap=tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:range=tv')
-    cmd = pre + ['-i', src, '-an', '-sn', '-map', '0:v:0']
-    if filters:
-        cmd += ['-vf', ",".join(filters)]
-    return cmd + ['-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
+    return ",".join(filters) if filters else None
 
 
 def build_encode_cmd(up_w, up_h, fps, target_w, target_h, out_path, video_args,

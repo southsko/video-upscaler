@@ -234,13 +234,16 @@ def create_app(state):
         path = body.get("path")
         ts = float(body.get("timestamp", 1.0))
         settings = body.get("settings", {})
+        crop = int(body.get("crop", 480))
+        cx = float(body.get("cx", 0.5)); cy = float(body.get("cy", 0.5))
         try:
             # torch inference is blocking — run it off the event loop so the
             # server (queue, websockets, other requests) stays responsive.
-            before_b64, after_b64 = await run_in_threadpool(_make_preview, path, ts, settings)
+            before_b64, after_b64 = await run_in_threadpool(
+                _make_preview, path, ts, settings, crop, (cx, cy))
         except Exception as e:                        # noqa: BLE001
             raise HTTPException(500, f"Preview failed: {e}")
-        return {"before": before_b64, "after": after_b64}
+        return {"before": before_b64, "after": after_b64, "crop": crop}
 
     @app.websocket("/ws")
     async def ws(websocket: WebSocket):
@@ -278,21 +281,34 @@ def create_app(state):
 
 
 # ── preview helper (before/after single frame) ────────────────────────────────
-def _make_preview(path, timestamp, settings):
+def _make_preview(path, timestamp, settings, crop=480, center=(0.5, 0.5)):
+    """Upscale a small CENTERED CROP of one frame (not the whole frame) — instant
+    even at 4K and shows true 100% pixel detail. Applies the same deinterlace/
+    HDR-tonemap the real job would, so the preview matches the output."""
     import base64
+    import subprocess
     import numpy as np
     import cv2
-    # grab one frame at timestamp as rgb24
-    w = h = None
     meta = U.probe(path)
     w, h = meta["width"], meta["height"]
+    di, tm = U._decode_flags(meta, settings)
     cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', str(timestamp),
-           '-i', path, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
-    import subprocess
+           '-i', path, '-frames:v', '1']
+    vf = U.source_vf(di, tm, meta.get("color_transfer") or "smpte2084")
+    if vf:
+        cmd += ['-vf', vf]
+    cmd += ['-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
     raw = subprocess.run(cmd, capture_output=True).stdout
     if len(raw) < w * h * 3:
         raise RuntimeError("could not read a frame at that timestamp")
-    before = np.frombuffer(raw[:w * h * 3], np.uint8).reshape(h, w, 3)
+    frame = np.frombuffer(raw[:w * h * 3], np.uint8).reshape(h, w, 3)
+
+    # centered detail crop (16:9-ish, capped so upscaling is fast)
+    cw = min(w, crop)
+    ch = min(h, max(1, round(cw * 9 / 16)))
+    x0 = int(min(max(center[0] * w - cw / 2, 0), w - cw))
+    y0 = int(min(max(center[1] * h - ch / 2, 0), h - ch))
+    before = np.ascontiguousarray(frame[y0:y0 + ch, x0:x0 + cw])
 
     model_path = U.resolve_model(settings.get("model", U.DEFAULT_MODEL),
                                  settings.get("weights_dir", U.DEFAULT_WEIGHTS_DIR),
@@ -302,7 +318,7 @@ def _make_preview(path, timestamp, settings):
 
     def enc(img_rgb):
         bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-        okj, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        okj, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
         return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
 
     return enc(before), enc(after)
