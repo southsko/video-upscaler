@@ -91,7 +91,10 @@
           </div>
           <div class="field">
             <label>Output folder <span class="hint">— blank = next to each source</span></label>
-            <input type="text" id="output" placeholder="(same folder as source)">
+            <div style="display:flex;gap:8px">
+              <input type="text" id="output" placeholder="(same folder as source)" style="flex:1;min-width:0">
+              <button class="btn ghost sm" id="output-browse" title="Pick an output folder">📁 Browse</button>
+            </div>
           </div>
 
           <div class="grouphead">Model</div>
@@ -163,7 +166,7 @@
 <div class="overlay" id="overlay"></div>
 <div class="modal" id="browser-modal">
   <div class="mhead">
-    <h3>📁 Choose videos</h3>
+    <h3 id="browser-title">📁 Choose videos</h3>
     <div class="spacer"></div>
     <button class="btn ghost sm" id="browser-close">Close</button>
   </div>
@@ -174,6 +177,7 @@
     <div class="spacer"></div>
     <button class="btn ghost" id="add-folder-btn" title="Add every video under this folder (recursive)">Add whole folder</button>
     <button class="btn primary" id="add-selected-btn">Add selected</button>
+    <button class="btn primary" id="use-folder-btn" style="display:none">Use this folder</button>
   </div>
 </div>
 

@@ -194,9 +194,17 @@ function upsertJob(job) {
 
 /* ── file browser modal ──────────────────────────────────── */
 let curPath = "ROOT";
+let browserMode = "files";           // "files" (add to queue) | "output" (pick a folder)
 const selected = new Set();
-function openBrowser() {
+function openBrowser(mode) {
+  browserMode = mode === "output" ? "output" : "files";
   selected.clear();
+  const out = browserMode === "output";
+  $("browser-title").textContent = out ? "📁 Choose an output folder" : "📁 Choose videos";
+  $("add-folder-btn").style.display = out ? "none" : "";
+  $("add-selected-btn").style.display = out ? "none" : "";
+  $("sel-count").style.display = out ? "none" : "";
+  $("use-folder-btn").style.display = out ? "" : "none";
   $("overlay").classList.add("show");
   $("browser-modal").classList.add("show");
   navigate("ROOT");
@@ -210,6 +218,11 @@ async function navigate(path) {
   try { data = await api("/api/browse?path=" + encodeURIComponent(path)); }
   catch (e) { toast("Browse failed", e.message, "bad"); return; }
   curPath = data.path;
+  if (browserMode === "output") {
+    const ub = $("use-folder-btn");
+    ub.textContent = curPath === "ROOT" ? "Pick a folder…" : "Use this folder";
+    ub.disabled = curPath === "ROOT";
+  }
   renderBreadcrumb(data);
   const box = $("browser");
   box.innerHTML = "";
@@ -366,6 +379,11 @@ function wire() {
   $("overlay").onclick = closeBrowser;
   $("add-selected-btn").onclick = () => addPaths([...selected]);
   $("add-folder-btn").onclick = () => addPaths([curPath]);
+  $("output-browse").onclick = () => openBrowser("output");
+  $("use-folder-btn").onclick = () => {
+    if (curPath && curPath !== "ROOT") { $("output").value = curPath; }
+    closeBrowser();
+  };
   $("preview-btn").onclick = runPreview;
   $("model").onchange = updateModelNote;
   $("bench-btn").onclick = runBenchmark;
