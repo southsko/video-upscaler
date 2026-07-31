@@ -24,6 +24,7 @@ import argparse
 import glob
 import hashlib
 import json
+import logging
 import math
 import os
 import queue
@@ -42,6 +43,27 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
+
+
+def _setup_logging():
+    """Configure logging to both console and file."""
+    log_dir = os.environ.get("LOG_DIR", "/app/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger("video-upscaler")
+    logger.setLevel(logging.DEBUG)
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(ch)
+    # File handler
+    fh = logging.FileHandler(os.path.join(log_dir, "upscaler.log"), encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+    logger.addHandler(fh)
+    return logger
+
+log = _setup_logging()
 
 # ── colorama (optional, nicer colours) ────────────────────────────────────────
 try:
@@ -610,7 +632,7 @@ def build_video_args(opts):
         args = ['-c:v', codec, '-profile:v', profile, '-pix_fmt', pix_fmt,
                 '-preset', preset, '-tune', tune, '-rc', 'constqp', '-qp', qp,
                 '-b:v', '0', '-g', gop, '-bf', bf, '-rc-lookahead', lookahead,
-                '-spatial_aq', '1', '-aq-strength', aq]
+                '-spatial-aq', '1', '-aq-strength', aq]
     else:  # libx264 CPU fallback
         args = ['-c:v', 'libx264', '-profile:v', 'high', '-preset', 'slow',
                 '-crf', qp, '-pix_fmt', pix_fmt, '-g', gop]
@@ -799,6 +821,9 @@ class Job:
         # control
         self._cancel = threading.Event()
         self._pause = threading.Event()   # set == paused
+        # live preview (latest original + upscaled frame pair, JPEG bytes)
+        self._live_preview = None
+        self._live_preview_seq = 0
 
     # --- control ---
     def cancel(self):
@@ -914,6 +939,29 @@ def _decode_flags(meta, settings):
     return deint, tonemap
 
 
+def _push_live_preview(job, src_frame, up_frame):
+    """Encode source + upscaled RGB frames as JPEG and stash on the job."""
+    import cv2
+    try:
+        def encode_jpg(rgb, max_side=640):
+            h, w = rgb.shape[:2]
+            scale = min(1.0, max_side / max(h, w))
+            if scale < 1.0:
+                rgb = cv2.resize(rgb, (int(w * scale), int(h * scale)),
+                                 interpolation=cv2.INTER_AREA)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            _, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            return buf.tobytes()
+        job._live_preview = {
+            "src": encode_jpg(src_frame),
+            "upscaled": encode_jpg(up_frame),
+            "seq": job._live_preview_seq,
+        }
+        job._live_preview_seq += 1
+    except Exception:
+        pass  # preview is best-effort, never break the pipeline
+
+
 def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
                      video_args, out_seg, on_progress, interpolator=None):
     """Stream one source-segment file: decode -> (interpolate) -> GPU upscale ->
@@ -979,16 +1027,19 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
     wt = threading.Thread(target=writer, daemon=True)
     rt.start(); wt.start()
 
+    _preview_interval = max(1, int(fps_in / 2))  # ~2 previews per second
+    _last_src_frame = [None]
+
     def src_frames():
         while True:
             f = in_q.get()
             if f is None:
                 return
+            _last_src_frame[0] = f
             yield f
 
     dedup = None
     if getattr(upscaler, "is_temporal", False):
-        # temporal VSR: windowed, no per-frame dedup (it wants real neighbours)
         stream = _vsr_stream(src_frames(), upscaler.enhance_clip, upscaler.window)
     else:
         enh = upscaler.enhance
@@ -997,15 +1048,17 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
             enh = dedup
         if interpolating and abs(fps_out - fps_in) > 1e-6:
             interp = interpolator.interpolate
-            if order == "post":       # upscale first, interpolate at target res
+            if order == "post":
                 stream = _resample((enh(f) for f in src_frames()), fps_in, fps_out, interp)
-            else:                      # pre (default): interpolate at source res, then upscale
+            else:
                 stream = (enh(f) for f in _resample(src_frames(), fps_in, fps_out, interp))
         else:
             stream = (enh(f) for f in src_frames())
 
+    import psutil as _psutil
     t0 = time.time()
     seg_frames = 0
+    _mem_check_interval = max(1, int(fps_in * 5))
     for out_frame in stream:
         if job._cancel.is_set():
             break
@@ -1013,6 +1066,18 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
         out_q.put(out_frame)
         seg_frames += 1
         job.done_frames += 1
+        elapsed = time.time() - t0
+        if elapsed > 0:
+            job.fps = seg_frames / elapsed
+        # Memory monitoring
+        if seg_frames % _mem_check_interval == 0:
+            mem = _psutil.virtual_memory()
+            if mem.percent > 95:
+                log.warning("CRITICAL MEMORY: %s%% used! Pausing 10s...", mem.percent)
+                time.sleep(10)
+        # Live preview
+        if seg_frames % _preview_interval == 0 and _last_src_frame[0] is not None:
+            _push_live_preview(job, _last_src_frame[0], out_frame)
         elapsed = time.time() - t0
         if elapsed > 0:
             job.fps = seg_frames / elapsed
@@ -1067,8 +1132,12 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
     """Full pipeline for one Job. `upscaler` is a ready Upscaler/VSRUpscaler (or
     None when settings['external_cmd'] drives an external per-segment upscaler);
     `interpolator` is an optional ready Interpolator (RIFE) for fps boost."""
+    import psutil
     job.status = "running"
     job.started = time.time()
+    log.info("Starting job %s: %s", job.id, job.src)
+    log.info("Target: %s, Model: %s", job.settings.get('target', '4k'), job.settings.get('model', 'default'))
+    log.info("Memory at start: %s%% used, %.1fMB RSS", psutil.virtual_memory().percent, psutil.Process().memory_info().rss / 1024**2)
     try:
         meta = probe(job.src)
         job.meta = {k: meta[k] for k in ("width", "height", "fps", "duration",
@@ -1182,13 +1251,18 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
 
         job.status = "done"
         job.finished = time.time()
+        log.info("Job %s completed in %.1fs", job.id, job.finished - job.started)
         if on_progress:
             on_progress(job)
         return job
     except Exception as e:                           # noqa: BLE001
+        import traceback
         job.status = "failed"
         job.error = str(e)
         job.finished = time.time()
+        log.error("Job %s failed after %.1fs: %s", job.id, job.finished - job.started, e)
+        log.error("Memory: %s%% used, %.1fMB RSS", psutil.virtual_memory().percent, psutil.Process().memory_info().rss / 1024**2)
+        log.error(traceback.format_exc())
         if on_progress:
             on_progress(job)
         return job

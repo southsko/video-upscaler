@@ -210,6 +210,25 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
 .preview-ctl { display: flex; gap: 10px; align-items: end; margin-top: 12px; flex-wrap: wrap; }
 .preview-ctl .field { flex: 1; min-width: 120px; padding: 0; }
 
+/* ── live preview ────────────────────────────────────────── */
+.live-info { display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--text-dim); flex-wrap: wrap; }
+.live-info span { white-space: nowrap; }
+#live-compare { aspect-ratio: 16/9; }
+#live-compare img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; background: var(--bg-2); }
+#live-compare .after-wrap { position: absolute; inset: 0; overflow: hidden; width: 50%; }
+#live-compare .after-wrap img { width: 100%; height: 100%; object-fit: contain; }
+#live-compare .divider { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; box-shadow: 0 0 10px rgba(0,0,0,.6); left: 50%; }
+#live-compare .knob {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  width: 36px; height: 36px; border-radius: 50%; background: var(--accent);
+  display: grid; place-items: center; font-size: 13px; cursor: ew-resize;
+  box-shadow: 0 2px 10px rgba(0,0,0,.5); user-select: none; z-index: 2;
+}
+#live-compare .lbl { position: absolute; bottom: 8px; font-size: 10.5px; font-weight: 700; letter-spacing: .5px;
+  background: rgba(0,0,0,.55); padding: 3px 8px; border-radius: 6px; z-index: 2; }
+#live-compare .lbl.b { left: 8px; } #live-compare .lbl.a { right: 8px; }
+#live-compare .placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text-faint); text-align: center; padding: 20px; }
+
 /* ── modal (file browser) ────────────────────────────────── */
 .overlay { position: fixed; inset: 0; background: rgba(4,6,12,.62); backdrop-filter: blur(3px); z-index: 50; display: none; }
 .overlay.show { display: block; }

@@ -158,6 +158,32 @@
           <div class="hint" style="margin-top:8px">Shows a 100% centered detail crop (fast at any resolution) with the selected model + HDR/deinterlace handling.</div>
         </div>
       </section>
+
+      <!-- LIVE PREVIEW -->
+      <section class="panel">
+        <div class="head">
+          <h2>🔴 LIVE PREVIEW</h2>
+          <div class="spacer"></div>
+          <span class="hint" id="live-status">idle</span>
+          <button class="btn primary sm" id="live-toggle">▶ Watch</button>
+        </div>
+        <div class="preview-wrap">
+          <div class="compare" id="live-compare">
+            <div class="placeholder" id="live-ph">Start a job, then click <b>Watch</b> to see a live side-by-side comparison as frames are upscaled.</div>
+            <img id="live-before" style="display:none">
+            <div class="after-wrap" id="live-after-wrap" style="display:none"><img id="live-after"></div>
+            <div class="divider" id="live-divider" style="display:none"></div>
+            <div class="knob" id="live-knob" style="display:none">⇔</div>
+            <span class="lbl b" id="live-lbl-b" style="display:none">SOURCE</span>
+            <span class="lbl a" id="live-lbl-a" style="display:none">UPSCALED</span>
+          </div>
+          <div class="live-info">
+            <span id="live-fps"></span>
+            <span id="live-progress"></span>
+            <span id="live-name"></span>
+          </div>
+        </div>
+      </section>
     </div>
   </main>
 </div>

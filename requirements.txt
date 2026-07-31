@@ -17,6 +17,7 @@ huggingface_hub>=0.24    # download models by HF repo id
 numpy>=1.24
 opencv-python>=4.9       # frame <-> ndarray, preview JPEG encode
 pillow>=10.0             # preview image encode
+psutil>=5.9.0            # memory monitoring
 
 # --- web UI ---
 fastapi>=0.110

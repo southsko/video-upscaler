@@ -240,10 +240,11 @@ function renderBreadcrumb(data) {
   };
   add("💻 This PC", "ROOT");
   if (data.path && data.path !== "ROOT") {
+    const sep = data.path.includes("\\") ? "\\" : "/";
     const parts = data.path.split(/[\\/]/).filter(Boolean);
     let acc = "";
     parts.forEach((p, i) => {
-      acc += (i === 0 ? p + "\\" : p + "\\");
+      acc += (i === 0 && sep === "\\" ? p + "\\" : (sep === "/" && i === 0 ? "/" : p + sep));
       bc.appendChild(document.createTextNode(" › "));
       add(p, acc);
     });
@@ -396,6 +397,103 @@ function wire() {
       b.classList.add("active");
       $("target-custom").style.display = b.dataset.v === "custom" ? "" : "none";
     });
+  initLivePreview();
+}
+
+/* ── live preview (WebSocket comparison) ─────────────────── */
+let liveWS = null;
+let liveDragging = false;
+let liveComparePct = 50;
+
+function initLivePreview() {
+  const btn = $("live-toggle");
+  btn.onclick = () => {
+    if (liveWS) {
+      stopLivePreview();
+    } else {
+      startLivePreview();
+    }
+  };
+
+  // Comparison slider drag
+  const c = $("live-compare");
+  const move = (clientX) => {
+    const r = c.getBoundingClientRect();
+    liveComparePct = Math.max(0, Math.min(100, ((clientX - r.left) / r.width) * 100));
+    setLiveCompare(liveComparePct);
+  };
+  const down = (e) => { liveDragging = true; move((e.touches ? e.touches[0] : e).clientX); e.preventDefault(); };
+  const mv = (e) => { if (liveDragging) move((e.touches ? e.touches[0] : e).clientX); };
+  const up = () => { liveDragging = false; };
+  c.addEventListener("mousedown", down); c.addEventListener("touchstart", down, { passive: false });
+  window.addEventListener("mousemove", mv); window.addEventListener("touchmove", mv);
+  window.addEventListener("mouseup", up); window.addEventListener("touchend", up);
+}
+
+function setLiveCompare(pct) {
+  pct = Math.max(0, Math.min(100, pct));
+  $("live-after-wrap").style.width = pct + "%";
+  $("live-divider").style.left = pct + "%";
+  $("live-knob").style.left = pct + "%";
+}
+
+function startLivePreview() {
+  if (liveWS) return;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${proto}://${location.host}/ws/preview${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
+  liveWS = new WebSocket(url);
+
+  $("live-toggle").textContent = "⏸ Pause";
+  $("live-status").textContent = "connecting…";
+
+  liveWS.onopen = () => {
+    $("live-status").textContent = "watching";
+  };
+
+  liveWS.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type !== "preview") return;
+
+    $("live-ph").style.display = "none";
+    $("live-before").style.display = "";
+    $("live-after-wrap").style.display = "";
+    $("live-divider").style.display = "";
+    $("live-knob").style.display = "";
+    $("live-lbl-b").style.display = "";
+    $("live-lbl-a").style.display = "";
+
+    $("live-before").src = msg.src;
+    $("live-after").src = msg.upscaled;
+    $("live-fps").textContent = msg.fps ? msg.fps.toFixed(1) + " fps" : "";
+    $("live-progress").textContent = msg.progress != null ? (msg.progress * 100).toFixed(1) + "%" : "";
+    $("live-name").textContent = msg.name || "";
+    $("live-status").textContent = "● live";
+  };
+
+  liveWS.onclose = () => {
+    if (liveWS) {
+      liveWS = null;
+      // Auto-reconnect after a delay if the job might still be running
+      setTimeout(() => {
+        if (!liveWS && state.jobs.some(j => j.status === "running")) {
+          startLivePreview();
+        }
+      }, 2000);
+    }
+  };
+
+  liveWS.onerror = () => {
+    if (liveWS) liveWS.close();
+  };
+}
+
+function stopLivePreview() {
+  if (liveWS) {
+    liveWS.close();
+    liveWS = null;
+  }
+  $("live-toggle").textContent = "▶ Watch";
+  $("live-status").textContent = "stopped";
 }
 
 async function boot() {

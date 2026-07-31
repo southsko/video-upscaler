@@ -17,3 +17,4 @@ models/
 # runtime state / scratch
 jobs.json
 *.part
+logs/

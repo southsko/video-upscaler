@@ -1,0 +1,29 @@
+services:
+  video-upscaler:
+    build: .
+    container_name: video-upscaler
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8848:8848"
+    volumes:
+      - /mnt/user/media:/media:ro
+      - ./models:/app/models
+      - ./logs:/app/logs
+    # Resource limits to prevent host OOM
+    deploy:
+      resources:
+        limits:
+          memory: 32g
+          cpus: "8"
+        reservations:
+          memory: 4g
+          cpus: "2"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    restart: unless-stopped

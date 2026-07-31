@@ -65,6 +65,21 @@ class Hub:
 
 # ── filesystem browser (server-side) ──────────────────────────────────────────
 def list_drives():
+    # Linux / macOS: return filesystem root entries
+    if os.name != "nt":
+        entries = []
+        try:
+            for name in sorted(os.listdir("/"), key=str.lower):
+                full = os.path.join("/", name)
+                try:
+                    if os.path.isdir(full):
+                        entries.append({"name": name, "path": full, "kind": "dir"})
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return entries
+    # Windows: list drive letters
     drives = []
     for letter in string.ascii_uppercase:
         root = f"{letter}:\\"
@@ -278,6 +293,43 @@ def create_app(state):
         finally:
             hub.clients.discard(websocket)
 
+    @app.websocket("/ws/preview")
+    async def ws_preview(websocket: WebSocket):
+        """Stream live before/after frame pairs from the running job."""
+        import base64
+        if state["token"]:
+            if websocket.query_params.get("token") != state["token"]:
+                await websocket.close(code=1008)
+                return
+        await websocket.accept()
+        last_seq = -1
+        try:
+            while True:
+                running_job = None
+                for j in q.jobs:
+                    if j.status == "running":
+                        running_job = j
+                        break
+                if running_job and running_job._live_preview:
+                    preview = running_job._live_preview
+                    seq = preview.get("seq", 0)
+                    if seq != last_seq:
+                        last_seq = seq
+                        await websocket.send_json({
+                            "type": "preview",
+                            "src": "data:image/jpeg;base64," + base64.b64encode(preview["src"]).decode(),
+                            "upscaled": "data:image/jpeg;base64," + base64.b64encode(preview["upscaled"]).decode(),
+                            "seq": seq,
+                            "name": running_job.name,
+                            "fps": running_job.fps,
+                            "progress": running_job.progress,
+                        })
+                await asyncio.sleep(0.5)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+
     @app.on_event("startup")
     async def _startup():
         loop = asyncio.get_running_loop()
@@ -375,7 +427,8 @@ def serve(args):
     host = args.host
     port = args.port
     is_local = host in ("127.0.0.1", "localhost", "::1")
-    token = None if is_local else _gen_token()
+    # Token disabled for local network use
+    token = None
 
     persist = os.path.join(U.HERE, "jobs.json")
     q = U.JobQueue(persist_path=persist)
