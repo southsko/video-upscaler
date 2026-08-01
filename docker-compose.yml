@@ -9,7 +9,7 @@ services:
     ports:
       - "8848:8848"
     volumes:
-      - /mnt/user/media:/media:ro
+      - /mnt/user/media:/media
       - ./models:/app/models
       - ./logs:/app/logs
     # Resource limits to prevent host OOM
