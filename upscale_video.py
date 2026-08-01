@@ -958,8 +958,8 @@ def _push_live_preview(job, src_frame, up_frame):
             "seq": job._live_preview_seq,
         }
         job._live_preview_seq += 1
-    except Exception:
-        pass  # preview is best-effort, never break the pipeline
+    except Exception as e:
+        log.debug("Live preview encode failed: %s", e)
 
 
 def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
@@ -1078,6 +1078,8 @@ def _process_segment(job, upscaler, src_seg, info_meta, up_w, up_h, target,
         # Live preview
         if seg_frames % _preview_interval == 0 and _last_src_frame[0] is not None:
             _push_live_preview(job, _last_src_frame[0], out_frame)
+            if job._live_preview:
+                log.debug("Live preview pushed: seq=%d", job._live_preview_seq)
         elapsed = time.time() - t0
         if elapsed > 0:
             job.fps = seg_frames / elapsed

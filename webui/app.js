@@ -159,7 +159,7 @@ function updateStartBtn() {
   b.textContent = state.running ? "⏸ Pause queue" : "▶ Start";
   b.classList.toggle("primary", !state.running);
   b.classList.toggle("ghost", state.running);
-  b.disabled = !active && !state.running;
+  b.disabled = !state.jobs.length && !state.running;
   if (s) s.style.display = state.running ? "" : "none";   // Stop only while running
 }
 async function queueAction(action) {
@@ -322,7 +322,7 @@ async function runPreview() {
     $("preview-ph").style.display = "none";
     $("img-before").src = r.before; $("img-after").src = r.after;
     ["img-before", "after-wrap", "divider", "knob", "lbl-b", "lbl-a"].forEach((id) => $(id).style.display = "");
-    sizeAfter(); setCompare(50);
+    setCompare(50);
   } catch (e) {
     toast("Preview failed", e.message, "bad");
   } finally { btn.disabled = false; btn.textContent = "Preview"; }
@@ -330,7 +330,7 @@ async function runPreview() {
 function sizeAfter() { $("img-after").style.width = $("compare").clientWidth + "px"; }
 function setCompare(pct) {
   pct = Math.max(0, Math.min(100, pct));
-  $("after-wrap").style.width = pct + "%";
+  $("after").style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
   $("divider").style.left = pct + "%";
   $("knob").style.left = pct + "%";
 }
@@ -406,14 +406,37 @@ let liveDragging = false;
 let liveComparePct = 50;
 
 function initLivePreview() {
-  const btn = $("live-toggle");
-  btn.onclick = () => {
-    if (liveWS) {
-      stopLivePreview();
-    } else {
-      startLivePreview();
-    }
+  // Watch/Pause button inside popup
+  $("live-toggle").onclick = () => {
+    if (liveWS) stopLivePreview(); else startLivePreview();
   };
+
+  // Topbar button shows/hides popup
+  $("live-popup-toggle").onclick = () => {
+    const p = $("live-popup");
+    p.style.display = p.style.display === "none" ? "flex" : "none";
+  };
+
+  // Close button hides popup
+  $("live-popup-close").onclick = () => { $("live-popup").style.display = "none"; };
+
+  // Drag popup by header
+  const popup = $("live-popup");
+  const head = $("live-popup-head");
+  let dragOff = null;
+  head.addEventListener("mousedown", (e) => {
+    if (e.target.closest("button")) return;
+    const r = popup.getBoundingClientRect();
+    dragOff = { x: e.clientX - r.left, y: e.clientY - r.top };
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragOff) return;
+    popup.style.left = Math.max(0, e.clientX - dragOff.x) + "px";
+    popup.style.top = Math.max(0, e.clientY - dragOff.y) + "px";
+    popup.style.right = "auto";
+  });
+  window.addEventListener("mouseup", () => { dragOff = null; });
 
   // Comparison slider drag
   const c = $("live-compare");
@@ -432,7 +455,7 @@ function initLivePreview() {
 
 function setLiveCompare(pct) {
   pct = Math.max(0, Math.min(100, pct));
-  $("live-after-wrap").style.width = pct + "%";
+  $("live-after").style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
   $("live-divider").style.left = pct + "%";
   $("live-knob").style.left = pct + "%";
 }

@@ -320,15 +320,17 @@ def create_app(state):
                             "src": "data:image/jpeg;base64," + base64.b64encode(preview["src"]).decode(),
                             "upscaled": "data:image/jpeg;base64," + base64.b64encode(preview["upscaled"]).decode(),
                             "seq": seq,
-                            "name": running_job.name,
+                            "name": os.path.basename(running_job.src),
                             "fps": running_job.fps,
                             "progress": running_job.progress,
                         })
                 await asyncio.sleep(0.5)
         except WebSocketDisconnect:
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback, sys
+            print(f"[WS/PREVIEW ERROR] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
 
     @app.on_event("startup")
     async def _startup():

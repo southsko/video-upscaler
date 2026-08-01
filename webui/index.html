@@ -18,6 +18,7 @@
       </div>
     </div>
     <div class="spacer"></div>
+    <button class="btn primary sm" id="live-popup-toggle">🔴 Live</button>
     <div class="chips" id="chips">
       <span class="chip" id="chip-gpu"><span class="dot"></span> GPU …</span>
       <span class="chip" id="chip-enc"><span class="dot"></span> encoder …</span>
@@ -141,8 +142,8 @@
             <div class="after-wrap" id="after-wrap" style="display:none"><img id="img-after"></div>
             <div class="divider" id="divider" style="display:none"></div>
             <div class="knob" id="knob" style="display:none">⇔</div>
-            <span class="lbl b" id="lbl-b" style="display:none">SOURCE</span>
-            <span class="lbl a" id="lbl-a" style="display:none">UPSCALED</span>
+            <span class="lbl b" id="lbl-b" style="display:none">UPSCALED</span>
+            <span class="lbl a" id="lbl-a" style="display:none">SOURCE</span>
           </div>
           <div class="preview-ctl">
             <div class="field" style="flex:2">
@@ -159,31 +160,6 @@
         </div>
       </section>
 
-      <!-- LIVE PREVIEW -->
-      <section class="panel">
-        <div class="head">
-          <h2>🔴 LIVE PREVIEW</h2>
-          <div class="spacer"></div>
-          <span class="hint" id="live-status">idle</span>
-          <button class="btn primary sm" id="live-toggle">▶ Watch</button>
-        </div>
-        <div class="preview-wrap">
-          <div class="compare" id="live-compare">
-            <div class="placeholder" id="live-ph">Start a job, then click <b>Watch</b> to see a live side-by-side comparison as frames are upscaled.</div>
-            <img id="live-before" style="display:none">
-            <div class="after-wrap" id="live-after-wrap" style="display:none"><img id="live-after"></div>
-            <div class="divider" id="live-divider" style="display:none"></div>
-            <div class="knob" id="live-knob" style="display:none">⇔</div>
-            <span class="lbl b" id="live-lbl-b" style="display:none">SOURCE</span>
-            <span class="lbl a" id="live-lbl-a" style="display:none">UPSCALED</span>
-          </div>
-          <div class="live-info">
-            <span id="live-fps"></span>
-            <span id="live-progress"></span>
-            <span id="live-name"></span>
-          </div>
-        </div>
-      </section>
     </div>
   </main>
 </div>
@@ -204,6 +180,33 @@
     <button class="btn ghost" id="add-folder-btn" title="Add every video under this folder (recursive)">Add whole folder</button>
     <button class="btn primary" id="add-selected-btn">Add selected</button>
     <button class="btn primary" id="use-folder-btn" style="display:none">Use this folder</button>
+  </div>
+</div>
+
+<!-- LIVE PREVIEW POPUP -->
+<div class="live-popup" id="live-popup" style="display:none">
+  <div class="live-popup-head" id="live-popup-head">
+    <span>🔴 LIVE</span>
+    <span class="hint" id="live-status">idle</span>
+    <div class="spacer"></div>
+    <button class="btn primary sm" id="live-toggle">▶ Watch</button>
+    <button class="btn ghost sm" id="live-popup-close">✕</button>
+  </div>
+  <div class="live-popup-body">
+    <div class="compare" id="live-compare">
+      <div class="placeholder" id="live-ph">Click <b>Watch</b> to see a live side-by-side comparison.</div>
+      <img id="live-before" style="display:none">
+      <div class="after-wrap" id="live-after-wrap" style="display:none"><img id="live-after"></div>
+      <div class="divider" id="live-divider" style="display:none"></div>
+      <div class="knob" id="live-knob" style="display:none">⇔</div>
+      <span class="lbl b" id="live-lbl-b" style="display:none">UPSCALED</span>
+      <span class="lbl a" id="live-lbl-a" style="display:none">SOURCE</span>
+    </div>
+    <div class="live-info">
+      <span id="live-fps"></span>
+      <span id="live-progress"></span>
+      <span id="live-name"></span>
+    </div>
   </div>
 </div>
 

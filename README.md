@@ -91,6 +91,41 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 
 Also needs **`ffmpeg`** + **`ffprobe`** on `PATH` (a full build, for NVENC).
 
+### Docker (recommended for servers)
+
+One command — pulls CUDA, PyTorch, ffmpeg, and all dependencies into an isolated container with GPU passthrough.
+
+**Requirements:** Docker, an NVIDIA GPU, and [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed.
+
+```bash
+git clone https://github.com/southsko/video-upscaler.git
+cd video-upscaler
+docker compose up -d --build
+```
+
+The UI is at **http://your-server:8848**. Edit `docker-compose.yml` to change the media mount path:
+
+```yaml
+volumes:
+  - /path/to/your/media:/media:ro   # ← change this
+```
+
+**What's included:**
+- NVIDIA GPU passthrough (NVENC encoding + CUDA inference)
+- Media mounted read-only at `/media`
+- Models persisted in `./models` (survives rebuilds)
+- Logs in `./logs/` with rotation (50MB × 5 files)
+- Auto-restart on crash (`unless-stopped`)
+- Memory (32GB) and CPU (8 cores) limits — adjust in `docker-compose.yml`
+
+**Useful commands:**
+```bash
+docker compose logs -f          # follow logs
+docker compose restart          # restart
+docker compose down             # stop
+docker compose up -d --build    # rebuild after updates
+```
+
 **Gotchas**
 - If `torch.cuda.is_available()` is `False`, you installed the CPU wheel — reinstall from the cu128 index.
 - Pick the CUDA index for your driver: newest → `cu128`, then `cu126`, `cu124`. Very new Python
