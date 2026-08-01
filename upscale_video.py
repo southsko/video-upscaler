@@ -1140,6 +1140,16 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
     log.info("Starting job %s: %s", job.id, job.src)
     log.info("Target: %s, Model: %s", job.settings.get('target', '4k'), job.settings.get('model', 'default'))
     log.info("Memory at start: %s%% used, %.1fMB RSS", psutil.virtual_memory().percent, psutil.Process().memory_info().rss / 1024**2)
+    # Verify output is writable before doing any work
+    dst = job.dst or default_output_path(job.src, job.settings)
+    out_dir = os.path.dirname(dst)
+    test_file = os.path.join(out_dir, f".write_test_{os.getpid()}")
+    try:
+        with open(test_file, "wb") as f:
+            f.write(b"x")
+        os.remove(test_file)
+    except OSError as e:
+        raise RuntimeError(f"Cannot write to output folder ({e}): {out_dir}")
     try:
         meta = probe(job.src)
         job.meta = {k: meta[k] for k in ("width", "height", "fps", "duration",
@@ -1250,6 +1260,22 @@ def run_job(job, upscaler, on_progress=None, interpolator=None):
 
         if not job.settings.get("keep_segments"):
             shutil.rmtree(scratch, ignore_errors=True)
+
+        # Verify output file actually exists and has content
+        if not os.path.isfile(dst):
+            raise RuntimeError(f"Output file was not created: {dst}")
+        out_size = os.path.getsize(dst)
+        if out_size < 1024:
+            raise RuntimeError(f"Output file is empty or corrupt ({out_size} bytes): {dst}")
+        # Quick probe to confirm it's a valid video
+        try:
+            p = probe(dst)
+            if int(p.get("nb_frames", 0)) < 1:
+                raise RuntimeError(f"Output file has no video frames: {dst}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Output file is not a valid video ({e}): {dst}")
 
         job.status = "done"
         job.finished = time.time()
