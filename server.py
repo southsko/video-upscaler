@@ -88,8 +88,10 @@ def list_drives():
     return drives
 
 
-def browse(path):
-    """Return {path, parent, entries[]} for a directory. '' or 'ROOT' -> drives."""
+def browse(path, kind="video"):
+    """Return {path, parent, entries[]} for a directory. '' or 'ROOT' -> drives.
+    kind='video' lists video files, kind='image' lists images."""
+    exts = U.IMAGE_EXTS if kind == "image" else U._VIDEO_EXTS
     if not path or path in ("ROOT", "/"):
         return {"path": "ROOT", "parent": None, "entries": list_drives()}
     path = os.path.abspath(path)
@@ -105,7 +107,7 @@ def browse(path):
             try:
                 if os.path.isdir(full):
                     dirs.append({"name": name, "path": full, "kind": "dir"})
-                elif os.path.splitext(name)[1].lower() in U._VIDEO_EXTS:
+                elif os.path.splitext(name)[1].lower() in exts:
                     files.append({"name": name, "path": full, "kind": "file",
                                   "size": os.path.getsize(full)})
             except OSError:
@@ -114,6 +116,119 @@ def browse(path):
         raise HTTPException(403, "Permission denied")
     return {"path": path, "parent": parent if parent else "ROOT",
             "entries": dirs + files}
+
+
+def _thumb_data_url(path_or_rgb, max_side=560, q=82):
+    """Small JPEG data URL from an image file path or an RGB ndarray."""
+    import base64
+    import cv2
+    import numpy as np
+    if isinstance(path_or_rgb, str):
+        rgb, _a = U._imread_rgb(path_or_rgb)
+    else:
+        rgb = path_or_rgb
+    h, w = rgb.shape[:2]
+    s = min(1.0, max_side / max(h, w))
+    if s < 1.0:
+        rgb = cv2.resize(rgb, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    _ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, q])
+    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
+
+
+def _photo_out_path(src, settings):
+    d = settings.get("output_dir") or os.path.dirname(src)
+    base = os.path.splitext(os.path.basename(src))[0]
+    suffix = settings.get("suffix", "_upscaled")
+    ext = "." + settings.get("format", "").lstrip(".") if settings.get("format") \
+        else (os.path.splitext(src)[1] or ".png")
+    out = os.path.join(d, f"{base}{suffix}{ext}")
+    return U.unique_output(out)
+
+
+class PhotoQueue:
+    """Batch image upscaler — mirrors the video queue but for stills (fast, so a
+    simple background worker + poll is plenty). Stores before/after thumbs per item."""
+
+    def __init__(self):
+        self.items = []
+        self.running = False
+        self._worker = None
+        self._cache = {}
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def add(self, paths, settings):
+        # expand folders -> image files
+        srcs = []
+        for p in paths:
+            p = os.path.abspath(p)
+            if os.path.isdir(p):
+                for dp, _dn, fs in os.walk(p):
+                    for f in sorted(fs):
+                        if os.path.splitext(f)[1].lower() in U.IMAGE_EXTS:
+                            srcs.append(os.path.join(dp, f))
+            elif os.path.isfile(p):
+                srcs.append(p)
+        added = []
+        with self._lock:
+            for src in srcs:
+                self._counter += 1
+                added.append({
+                    "id": f"ph{self._counter}", "src": src,
+                    "name": os.path.basename(src), "dst": _photo_out_path(src, settings),
+                    "status": "queued", "error": None, "settings": settings,
+                    "_before": None, "_after": None})
+            self.items.extend(added)
+        return added
+
+    def start(self):
+        self.running = True
+        if not (self._worker and self._worker.is_alive()):
+            self._worker = threading.Thread(target=self._run, daemon=True)
+            self._worker.start()
+
+    def stop(self):
+        self.running = False
+
+    def clear_done(self):
+        with self._lock:
+            self.items = [i for i in self.items if i["status"] not in ("done", "failed")]
+
+    def get(self, item_id):
+        return next((i for i in self.items if i["id"] == item_id), None)
+
+    def _get_upscaler(self, s):
+        path = U.resolve_model(s.get("model", U.DEFAULT_MODEL),
+                               s.get("weights_dir", U.DEFAULT_WEIGHTS_DIR), assume_yes=True)
+        key = (path, s.get("fp16", True), s.get("tile", 0))
+        if key not in self._cache:
+            self._cache[key] = U.Upscaler(path, gpu=s.get("gpu", 0),
+                                          fp16=s.get("fp16", True), tile=s.get("tile", 0))
+        return self._cache[key]
+
+    def _run(self):
+        while self.running:
+            it = next((i for i in self.items if i["status"] == "queued"), None)
+            if it is None:
+                self.running = False
+                return
+            it["status"] = "running"
+            try:
+                up = self._get_upscaler(it["settings"])
+                U.upscale_image_file(it["src"], it["dst"], up,
+                                     outscale=it["settings"].get("outscale"))
+                it["_before"] = _thumb_data_url(it["src"])
+                it["_after"] = _thumb_data_url(it["dst"])
+                it["status"] = "done"
+            except Exception as e:                       # noqa: BLE001
+                it["status"] = "failed"
+                it["error"] = str(e)[:200]
+
+    def snapshot(self):
+        return [{"id": i["id"], "name": i["name"], "dst": i["dst"],
+                 "status": i["status"], "error": i["error"],
+                 "has_preview": bool(i["_after"])} for i in self.items]
 
 
 # ── app factory ───────────────────────────────────────────────────────────────
@@ -171,9 +286,52 @@ def create_app(state):
             for n, (url, s, note) in U.BUILTIN_MODELS.items()]}
 
     @app.get("/api/browse")
-    def api_browse(request: Request, path: str = Query(""), token: str = Query(None)):
+    def api_browse(request: Request, path: str = Query(""), kind: str = Query("video"),
+                   token: str = Query(None)):
         check_token(request, token)
-        return browse(path)
+        return browse(path, kind)
+
+    # ── photos (image batch upscaling) ──────────────────────────────────────
+    pq = state["photos"]
+
+    @app.get("/api/photos/state")
+    def api_photos_state(request: Request, token: str = Query(None)):
+        check_token(request, token)
+        return {"items": pq.snapshot(), "running": pq.running}
+
+    @app.post("/api/photos/add")
+    async def api_photos_add(request: Request, token: str = Query(None)):
+        check_token(request, token)
+        body = await request.json()
+        added = pq.add(body.get("paths", []), body.get("settings", {}))
+        if not added:
+            raise HTTPException(400, "No images found in the given paths")
+        return {"added": [{"id": a["id"], "name": a["name"]} for a in added],
+                "items": pq.snapshot()}
+
+    @app.post("/api/photos/{action}")
+    def api_photos_action(action: str, request: Request, token: str = Query(None)):
+        check_token(request, token)
+        if action == "start":
+            if not _torch_ok():
+                raise HTTPException(503, "Upscaling needs torch/CUDA installed")
+            pq.start()
+        elif action == "stop":
+            pq.stop()
+        elif action == "clear":
+            pq.clear_done()
+        else:
+            raise HTTPException(400, f"Unknown action {action}")
+        return {"running": pq.running, "items": pq.snapshot()}
+
+    @app.get("/api/photos/{item_id}/preview")
+    def api_photos_preview(item_id: str, request: Request, token: str = Query(None)):
+        check_token(request, token)
+        it = pq.get(item_id)
+        if not it or not it["_after"]:
+            raise HTTPException(404, "No preview available")
+        return {"before": it["_before"], "after": it["_after"],
+                "dst": it["dst"], "name": it["name"]}
 
     @app.get("/api/state")
     def api_state(request: Request, token: str = Query(None)):
@@ -435,7 +593,7 @@ def serve(args):
     persist = os.path.join(U.HERE, "jobs.json")
     q = U.JobQueue(persist_path=persist)
     hub = Hub()
-    state = {"queue": q, "hub": hub, "token": token}
+    state = {"queue": q, "hub": hub, "token": token, "photos": PhotoQueue()}
     app = create_app(state)
 
     U.div()

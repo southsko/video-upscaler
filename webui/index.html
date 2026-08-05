@@ -26,7 +26,12 @@
     </div>
   </header>
 
-  <main>
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="video">🎬 Video</button>
+    <button class="tab" data-tab="photos">🖼 Photos</button>
+  </div>
+
+  <main id="view-video">
     <!-- QUEUE -->
     <section class="panel">
       <div class="head">
@@ -162,6 +167,90 @@
 
     </div>
   </main>
+
+  <!-- PHOTOS VIEW -->
+  <main id="view-photos" style="display:none">
+    <section class="panel">
+      <div class="head">
+        <h2>PHOTOS</h2>
+        <span class="count" id="ph-count"></span>
+        <div class="spacer"></div>
+        <button class="btn ghost sm" id="ph-clear">Clear finished</button>
+        <button class="btn primary sm" id="ph-start">▶ Upscale</button>
+        <button class="btn ghost sm" id="ph-add">＋ Add photos</button>
+      </div>
+      <div class="body">
+        <div class="photo-grid" id="photo-grid">
+          <div class="empty" id="ph-empty">
+            <div class="big">🖼</div>
+            <div>No photos added yet.</div>
+            <div style="margin-top:6px;color:var(--text-faint)">Click <b>Add photos</b> to browse your drives. Batch + before/after supported.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="head"><h2>SETTINGS</h2><span class="count">applied to new photos</span></div>
+      <div class="body">
+        <div class="field">
+          <label>Upscaling model
+            <button class="btn ghost sm" id="ph-bench" style="float:right;padding:3px 9px;font-size:11px" title="Benchmark models">⚡ Benchmark</button>
+          </label>
+          <select id="ph-model"></select>
+          <div class="hint" id="ph-model-note"></div>
+          <div id="bench-results" class="bench" style="display:none"></div>
+        </div>
+        <div class="field">
+          <label>…or a HuggingFace id / local path</label>
+          <input type="text" id="ph-model-custom" placeholder="e.g. Phips/4xNomos8kSC  or  D:\models\4x-UltraSharp.pth">
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label>Scale</label>
+            <select id="ph-scale">
+              <option value="">Model native (usually 4×)</option>
+              <option value="2">2×</option>
+              <option value="3">3×</option>
+              <option value="4">4×</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Save as</label>
+            <select id="ph-format">
+              <option value="">Same as source</option>
+              <option value="png">PNG</option>
+              <option value="jpg">JPG</option>
+              <option value="webp">WebP</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>Output folder <span class="hint">— blank = next to each source</span></label>
+          <div style="display:flex;gap:8px">
+            <input type="text" id="ph-output" placeholder="(same folder as source)" style="flex:1;min-width:0">
+            <button class="btn ghost sm" id="ph-output-browse" title="Pick an output folder">📁 Browse</button>
+          </div>
+        </div>
+        <div class="hint">For photos the heavy models (Real-ESRGAN x4plus, DAT, SwinIR) are great — it's one image, not a video. Diffusion (SUPIR/SD) needs a 24&nbsp;GB GPU.</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- photo before/after comparison modal -->
+<div class="overlay" id="ph-overlay"></div>
+<div class="modal ph-modal" id="ph-modal">
+  <div class="mhead"><h3 id="ph-modal-title">Before / After</h3><div class="spacer"></div>
+    <button class="btn ghost sm" id="ph-modal-close">Close</button></div>
+  <div class="compare" id="ph-compare" style="height:60vh">
+    <img id="ph-img-before" style="display:none">
+    <div class="after-wrap" id="ph-after-wrap" style="display:none"><img id="ph-img-after"></div>
+    <div class="divider" id="ph-divider" style="display:none"></div>
+    <div class="knob" id="ph-knob" style="display:none">⇔</div>
+    <span class="lbl b" id="ph-lbl-b" style="display:none">UPSCALED</span>
+    <span class="lbl a" id="ph-lbl-a" style="display:none">SOURCE</span>
+  </div>
 </div>
 
 <!-- FILE BROWSER MODAL -->

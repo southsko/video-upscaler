@@ -194,13 +194,16 @@ function upsertJob(job) {
 
 /* ── file browser modal ──────────────────────────────────── */
 let curPath = "ROOT";
-let browserMode = "files";           // "files" (add to queue) | "output" (pick a folder)
+let browserMode = "files";  // files | output | images | ph-output
+let browserKind = "video";  // video | image (what files to list)
 const selected = new Set();
 function openBrowser(mode) {
-  browserMode = mode === "output" ? "output" : "files";
+  browserMode = ["output", "images", "ph-output"].includes(mode) ? mode : "files";
+  browserKind = browserMode === "images" ? "image" : "video";
   selected.clear();
-  const out = browserMode === "output";
-  $("browser-title").textContent = out ? "📁 Choose an output folder" : "📁 Choose videos";
+  const out = browserMode === "output" || browserMode === "ph-output";
+  $("browser-title").textContent = out ? "📁 Choose an output folder"
+    : (browserKind === "image" ? "🖼 Choose photos" : "📁 Choose videos");
   $("add-folder-btn").style.display = out ? "none" : "";
   $("add-selected-btn").style.display = out ? "none" : "";
   $("sel-count").style.display = out ? "none" : "";
@@ -215,10 +218,10 @@ function closeBrowser() {
 }
 async function navigate(path) {
   let data;
-  try { data = await api("/api/browse?path=" + encodeURIComponent(path)); }
+  try { data = await api("/api/browse?path=" + encodeURIComponent(path) + "&kind=" + browserKind); }
   catch (e) { toast("Browse failed", e.message, "bad"); return; }
   curPath = data.path;
-  if (browserMode === "output") {
+  if (browserMode === "output" || browserMode === "ph-output") {
     const ub = $("use-folder-btn");
     ub.textContent = curPath === "ROOT" ? "Pick a folder…" : "Use this folder";
     ub.disabled = curPath === "ROOT";
@@ -370,6 +373,127 @@ function humanSize(n) {
   return (i === 0 ? n : n.toFixed(1)) + u[i];
 }
 
+/* ── photos tab ──────────────────────────────────────────── */
+state.photos = []; state.phRunning = false; state.photosInit = false;
+let phPoll = null;
+const _phPrevCache = {};
+
+function switchTab(tab) {
+  document.querySelectorAll("#tabs .tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $("view-video").style.display = tab === "video" ? "" : "none";
+  $("view-photos").style.display = tab === "photos" ? "" : "none";
+  if (tab === "photos" && !state.photosInit) initPhotos();
+}
+function initPhotos() {
+  state.photosInit = true;
+  const sel = $("ph-model"); sel.innerHTML = "";
+  state.models.forEach((m) => {
+    const o = document.createElement("option");
+    o.value = m.name; o.textContent = m.name + " (x" + m.scale + ")" + (m.cached ? " ✓" : "");
+    sel.appendChild(o);
+  });
+  if (state.models.find((m) => m.name === "realesrgan-x4plus")) sel.value = "realesrgan-x4plus";
+  updatePhModelNote();
+  loadPhotoState();
+}
+function updatePhModelNote() {
+  const m = state.models.find((x) => x.name === $("ph-model").value);
+  $("ph-model-note").textContent = m ? m.note + (m.cached ? "" : " — downloads on first use") : "";
+}
+function phSettings() {
+  return {
+    model: $("ph-model-custom").value.trim() || $("ph-model").value,
+    output_dir: $("ph-output").value.trim() || null,
+    outscale: parseInt($("ph-scale").value) || null,
+    format: $("ph-format").value || null, tile: 0, fp16: true,
+  };
+}
+async function addPhotos(paths) {
+  if (!paths.length) return;
+  try {
+    const r = await post("/api/photos/add", { paths, settings: phSettings() });
+    state.photos = r.items; renderPhotos(); phButtons(); closeBrowser();
+    toast("Added", r.added.length + " photo(s) — press Upscale", "ok");
+  } catch (e) { toast("Add failed", e.message, "bad"); }
+}
+async function photoAction(action) {
+  try {
+    const r = await post("/api/photos/" + action);
+    state.phRunning = r.running; state.photos = r.items; renderPhotos(); phButtons();
+    if (r.running) startPhPoll();
+  } catch (e) { toast("Action failed", e.message, "bad"); }
+}
+async function loadPhotoState() {
+  try {
+    const s = await api("/api/photos/state");
+    state.photos = s.items; state.phRunning = s.running; renderPhotos(); phButtons();
+    if (s.running) startPhPoll();
+  } catch (e) {}
+}
+function startPhPoll() {
+  if (phPoll) return;
+  phPoll = setInterval(async () => {
+    try {
+      const s = await api("/api/photos/state");
+      state.photos = s.items; state.phRunning = s.running; renderPhotos(); phButtons();
+      if (!s.running) { clearInterval(phPoll); phPoll = null; }
+    } catch (e) {}
+  }, 1500);
+}
+function phButtons() {
+  $("ph-start").textContent = state.phRunning ? "⏸ Stop" : "▶ Upscale";
+  $("ph-start").disabled = !state.phRunning && !state.photos.some((i) => ["queued", "running"].includes(i.status));
+}
+function renderPhotos() {
+  const grid = $("photo-grid");
+  $("ph-empty").style.display = state.photos.length ? "none" : "block";
+  $("ph-count").textContent = state.photos.length ? state.photos.length + " image" + (state.photos.length > 1 ? "s" : "") : "";
+  [...grid.querySelectorAll(".pcard")].forEach((n) => n.remove());
+  state.photos.forEach((it) => grid.appendChild(pcardNode(it)));
+}
+function pcardNode(it) {
+  const el = document.createElement("div");
+  el.className = "pcard " + it.status;
+  const icon = it.status === "running" ? "⏳" : it.status === "failed" ? "⚠" : "🖼";
+  el.innerHTML = (it.has_preview ? `<img class="thumb">` : `<div class="thumb placeholder">${icon}</div>`) +
+    `<div class="cap"><span class="nm" title="${esc(it.error || it.name)}">${esc(it.name)}</span><span class="st">${it.status}</span></div>`;
+  if (it.has_preview) {
+    const img = el.querySelector("img.thumb");
+    fetchPhPreview(it.id).then((p) => { if (p) img.src = p.after; });
+    img.onclick = () => openPhCompare(it.id);
+  }
+  return el;
+}
+async function fetchPhPreview(id) {
+  if (_phPrevCache[id]) return _phPrevCache[id];
+  try { const p = await api("/api/photos/" + id + "/preview"); _phPrevCache[id] = p; return p; }
+  catch (e) { return null; }
+}
+async function openPhCompare(id) {
+  const p = await fetchPhPreview(id); if (!p) return;
+  $("ph-modal-title").textContent = p.name;
+  $("ph-img-before").src = p.before; $("ph-img-after").src = p.after;
+  ["ph-img-before", "ph-after-wrap", "ph-divider", "ph-knob", "ph-lbl-b", "ph-lbl-a"].forEach((i) => $(i).style.display = "");
+  setPhCompare(50);
+  $("ph-overlay").classList.add("show"); $("ph-modal").classList.add("show");
+}
+function closePhCompare() { $("ph-overlay").classList.remove("show"); $("ph-modal").classList.remove("show"); }
+function setPhCompare(pct) {
+  pct = Math.max(0, Math.min(100, pct));
+  $("ph-after-wrap").style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
+  $("ph-divider").style.left = pct + "%"; $("ph-knob").style.left = pct + "%";
+}
+(function phDrag() {
+  let drag = false;
+  const cmp = () => $("ph-compare");
+  const move = (x) => { const r = cmp().getBoundingClientRect(); setPhCompare(((x - r.left) / r.width) * 100); };
+  document.addEventListener("mousedown", (e) => {
+    if ($("ph-modal").classList.contains("show") && cmp().contains(e.target)) { drag = true; move(e.clientX); }
+  });
+  document.addEventListener("mousemove", (e) => { if (drag) move(e.clientX); });
+  document.addEventListener("mouseup", () => { drag = false; });
+})();
+
 /* ── wire up ─────────────────────────────────────────────── */
 function wire() {
   $("add-btn").onclick = openBrowser;
@@ -378,13 +502,27 @@ function wire() {
   $("stop-btn").onclick = () => queueAction("stop");
   $("browser-close").onclick = closeBrowser;
   $("overlay").onclick = closeBrowser;
-  $("add-selected-btn").onclick = () => addPaths([...selected]);
-  $("add-folder-btn").onclick = () => addPaths([curPath]);
+  const addFromBrowser = (paths) => (browserMode === "images" ? addPhotos(paths) : addPaths(paths));
+  $("add-selected-btn").onclick = () => addFromBrowser([...selected]);
+  $("add-folder-btn").onclick = () => addFromBrowser([curPath]);
   $("output-browse").onclick = () => openBrowser("output");
   $("use-folder-btn").onclick = () => {
-    if (curPath && curPath !== "ROOT") { $("output").value = curPath; }
+    if (curPath && curPath !== "ROOT") {
+      $(browserMode === "ph-output" ? "ph-output" : "output").value = curPath;
+    }
     closeBrowser();
   };
+  // tabs
+  document.querySelectorAll("#tabs .tab").forEach((b) => b.onclick = () => switchTab(b.dataset.tab));
+  // photos
+  $("ph-add").onclick = () => openBrowser("images");
+  $("ph-start").onclick = () => photoAction(state.phRunning ? "stop" : "start");
+  $("ph-clear").onclick = () => photoAction("clear");
+  $("ph-output-browse").onclick = () => openBrowser("ph-output");
+  $("ph-model").onchange = updatePhModelNote;
+  $("ph-bench").onclick = runBenchmark;
+  $("ph-modal-close").onclick = closePhCompare;
+  $("ph-overlay").onclick = closePhCompare;
   $("preview-btn").onclick = runPreview;
   $("model").onchange = updateModelNote;
   $("bench-btn").onclick = runBenchmark;

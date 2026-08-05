@@ -96,6 +96,7 @@ _VIDEO_EXTS = {
     ".mxf", ".y4m", ".f4v", ".dv", ".nut", ".qt",
 }
 VIDEO_EXTENSIONS = [f"*{e}" for e in sorted(_VIDEO_EXTS)]   # glob patterns (case-insensitive FS)
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".jfif", ".avif"}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_WEIGHTS_DIR = os.environ.get("UPSCALE_WEIGHTS_DIR", os.path.join(HERE, "models"))
@@ -521,6 +522,68 @@ class Interpolator:
             out = self.model.inference(inp, timestep=float(t), scale=self.scale)
         out = out[:, :, :h, :w].squeeze(0).permute(1, 2, 0).clamp(0, 1)  # non-inplace
         return (out * 255).round().to(torch.uint8).cpu().numpy()
+
+
+def _imread_rgb(path):
+    """Unicode-safe image read -> (rgb_uint8, alpha_or_None)."""
+    import cv2
+    import numpy as np
+    data = np.fromfile(path, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"cannot read image: {path}")
+    if img.ndim == 2:                                   # grayscale
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    alpha = None
+    if img.shape[2] == 4:                               # split off alpha
+        alpha = img[:, :, 3]
+        img = img[:, :, :3]
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), alpha
+
+
+def _imwrite(path, rgb, alpha=None, quality=95):
+    """Unicode-safe image write (format from extension)."""
+    import cv2
+    import numpy as np
+    ext = os.path.splitext(path)[1].lower() or ".png"
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    if alpha is not None:
+        bgr = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+        bgr[:, :, 3] = alpha
+    params = []
+    if ext in (".jpg", ".jpeg"):
+        params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    elif ext == ".webp":
+        params = [cv2.IMWRITE_WEBP_QUALITY, quality]
+    ok, buf = cv2.imencode(ext, bgr, params)
+    if not ok:
+        raise RuntimeError(f"cannot encode {ext} image")
+    buf.tofile(path)
+    return path
+
+
+def upscale_image_file(src, dst, upscaler, outscale=None):
+    """Upscale one image with a loaded Upscaler. outscale = final multiple of the
+    ORIGINAL size (default = the model's native scale). Alpha is upscaled with the
+    model too (as a 3-ch grey) so transparent PNGs keep a matching mask."""
+    import cv2
+    rgb, alpha = _imread_rgb(src)
+    oh, ow = rgb.shape[:2]
+    up = upscaler.enhance(rgb)
+    if alpha is not None:                               # upscale the alpha channel too
+        a3 = cv2.cvtColor(alpha, cv2.COLOR_GRAY2RGB)
+        up_a = upscaler.enhance(a3)[:, :, 0]
+    else:
+        up_a = None
+    if outscale and abs(outscale - upscaler.scale) > 1e-3:
+        tw, th = int(round(ow * outscale)), int(round(oh * outscale))
+        interp = cv2.INTER_AREA if (tw < up.shape[1]) else cv2.INTER_LANCZOS4
+        up = cv2.resize(up, (tw, th), interpolation=interp)
+        if up_a is not None:
+            up_a = cv2.resize(up_a, (tw, th), interpolation=interp)
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    _imwrite(dst, up, up_a)
+    return dst
 
 
 # Temporal (multi-frame) VSR models via ccrestoration — reduce flicker by using
