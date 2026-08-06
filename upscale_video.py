@@ -465,17 +465,34 @@ class Upscaler:
         return out
 
     def enhance(self, img):
-        """img: HxWx3 RGB uint8 ndarray -> upscaled HxWx3 RGB uint8 ndarray."""
+        """img: HxWx3 RGB uint8 ndarray -> upscaled HxWx3 RGB uint8 ndarray.
+        VRAM-adaptive: on CUDA out-of-memory, shrink the tile and retry so the
+        SAME model runs on a small card (10 GB) or a big one (24 GB) — smaller
+        card just uses smaller tiles (slower) instead of crashing."""
         import numpy as np
         torch = self.torch
-        t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
-        t = t.unsqueeze(0).to(self.device).float().div_(255.0)
-        if self.fp16:
-            t = t.half()
-        # non-inplace: the no-tile path returns spandrel's inference-mode tensor,
-        # which forbids in-place ops (the tiled path returns a fresh tensor).
-        out = self._tiled(t).squeeze(0).permute(1, 2, 0).clamp(0, 1)
-        return (out * 255).round().to(torch.uint8).cpu().numpy()
+        while True:
+            try:
+                t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
+                t = t.unsqueeze(0).to(self.device).float().div_(255.0)
+                if self.fp16:
+                    t = t.half()
+                # non-inplace: the no-tile path returns spandrel's inference-mode
+                # tensor, which forbids in-place ops (tiled path returns a fresh one).
+                out = self._tiled(t).squeeze(0).permute(1, 2, 0).clamp(0, 1)
+                return (out * 255).round().to(torch.uint8).cpu().numpy()
+            except (getattr(torch.cuda, "OutOfMemoryError", RuntimeError), RuntimeError) as e:
+                if "out of memory" not in str(e).lower() or self.device.type != "cuda":
+                    raise
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                cur = self.tile if self.tile and self.tile > 0 else max(img.shape[0], img.shape[1])
+                new = max(64, cur // 2)
+                if new >= cur:
+                    raise                              # can't shrink further
+                warn(f"CUDA out of memory — reducing tile {cur}->{new} and retrying "
+                     f"(smaller card = smaller tiles).")
+                self.tile = new
 
 
 # RIFE model names available via ccvfi.ConfigType.

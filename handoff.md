@@ -1,10 +1,20 @@
 # Video Upscaler — Developer Handoff
 
-> **▶ RESUMING? START HERE.** Read this whole file + `README.md`, then run `python -m pytest` to
-> confirm the engine works. Env + architecture + gotchas + what's left are all below. Dev box is a
-> 10 GB RTX 3080; the owner's other machine is 24 GB (tier-3 diffusion needs that one). `git push`
-> works over SSH; **`git push --force` is blocked** — you'll be handed the command to run. When you
-> finish work, update this file and commit it so the next session stays accurate.
+> **▶ RESUMING? START HERE.** Read ONLY this file (it's self-contained), then ask the user for the
+> task. Do NOT re-explore the codebase or re-read every file — that wastes the user's usage. Run
+> `python -m pytest` (fast, no GPU) only if you changed engine logic. `git push` works over SSH;
+> **`git push --force` is blocked** — you'll be handed the command. Update+commit this file when done.
+>
+> **CHEAP RESUME (paste this to start a session):** *"Read handoff.md. Then do: <one task>. Don't
+> re-explore."* Keep the task specific. The whole project is already built & working — sessions are
+> for small changes, not re-derivation.
+>
+> **HARDWARE / COMPATIBILITY (a recurring question):** ONE codebase runs on ANY NVIDIA card. It is
+> NOT multi-GPU or networked — it adapts to whatever card it's on. `--tile 0` (default) auto-sizes
+> the tile from that card's free VRAM (~512 on a 10 GB 3080, ~1024 on a 24 GB 3090). If a model/tile
+> is too big it **catches CUDA OOM and auto-shrinks the tile and retries** (Upscaler.enhance), so the
+> same model just runs slower on a smaller card instead of crashing. Bigger card = heavier models
+> (DAT/SwinIR/x4plus) + diffusion (SUPIR/SD, 24 GB). Nothing to configure per machine.
 
 Self-contained context so a fresh session (any model) can continue without prior history.
 
