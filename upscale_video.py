@@ -102,6 +102,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_WEIGHTS_DIR = os.environ.get("UPSCALE_WEIGHTS_DIR", os.path.join(HERE, "models"))
 
 TARGET_PRESETS = {
+    "8k": (7680, 4320), "4320p": (7680, 4320),
     "4k": (3840, 2160), "2160p": (3840, 2160), "uhd": (3840, 2160),
     "1440p": (2560, 1440), "2k": (2560, 1440),
     "1080p": (1920, 1080), "fhd": (1920, 1080),

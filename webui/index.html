@@ -73,6 +73,7 @@
           <div class="field">
             <label>Target resolution</label>
             <div class="seg" id="target-seg">
+              <button data-v="8k">8K</button>
               <button data-v="4k" class="active">4K</button>
               <button data-v="1440p">1440p</button>
               <button data-v="1080p">1080p</button>
@@ -199,7 +200,7 @@
           </label>
           <select id="ph-model"></select>
           <div class="hint" id="ph-model-note"></div>
-          <div id="bench-results" class="bench" style="display:none"></div>
+          <div id="ph-bench-results" class="bench" style="display:none"></div>
         </div>
         <div class="field">
           <label>…or a HuggingFace id / local path</label>
@@ -213,6 +214,7 @@
               <option value="2">2×</option>
               <option value="3">3×</option>
               <option value="4">4×</option>
+              <option value="8">8×</option>
             </select>
           </div>
           <div class="field">
@@ -238,18 +240,23 @@
   </main>
 </div>
 
-<!-- photo before/after comparison modal -->
+<!-- photo zoom/pan viewer -->
 <div class="overlay" id="ph-overlay"></div>
-<div class="modal ph-modal" id="ph-modal">
-  <div class="mhead"><h3 id="ph-modal-title">Before / After</h3><div class="spacer"></div>
-    <button class="btn ghost sm" id="ph-modal-close">Close</button></div>
-  <div class="compare" id="ph-compare" style="height:60vh">
-    <img id="ph-img-before" style="display:none">
-    <div class="after-wrap" id="ph-after-wrap" style="display:none"><img id="ph-img-after"></div>
-    <div class="divider" id="ph-divider" style="display:none"></div>
-    <div class="knob" id="ph-knob" style="display:none">⇔</div>
-    <span class="lbl b" id="ph-lbl-b" style="display:none">UPSCALED</span>
-    <span class="lbl a" id="ph-lbl-a" style="display:none">SOURCE</span>
+<div class="modal ph-viewer" id="ph-modal">
+  <div class="mhead">
+    <h3 id="ph-modal-title">Preview</h3>
+    <div class="zoombar" id="ph-zoombar">
+      <button data-z="fit" class="active">Fit</button>
+      <button data-z="1">1×</button><button data-z="2">2×</button>
+      <button data-z="4">4×</button><button data-z="8">8×</button>
+    </div>
+    <button class="btn ghost sm" id="ph-view-toggle" title="Toggle source / upscaled">Showing: Upscaled</button>
+    <div class="spacer"></div>
+    <span class="hint" id="ph-zoomlbl" style="margin-right:10px">scroll = zoom · drag = pan</span>
+    <button class="btn ghost sm" id="ph-modal-close">Close</button>
+  </div>
+  <div class="ph-viewport" id="ph-viewport">
+    <img id="ph-img" draggable="false" alt="">
   </div>
 </div>
 

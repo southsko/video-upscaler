@@ -194,14 +194,20 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
 .pcard.done .cap .st { color: var(--ok); }
 .pcard.failed .cap .st { color: var(--danger); }
 .pcard.running .cap .st { color: var(--accent, #7c5cff); }
-.ph-modal { width: min(1100px, 94vw); }
-#ph-compare { position: relative; overflow: hidden; background: var(--bg); border-radius: 10px; user-select: none; }
-#ph-compare img { position: absolute; top: 0; left: 0; height: 100%; width: 100%; object-fit: contain; display: block; }
-#ph-compare .after-wrap { position: absolute; inset: 0; overflow: hidden; }
-#ph-compare .divider { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; transform: translateX(-1px); box-shadow: 0 0 6px rgba(0,0,0,.5); }
-#ph-compare .knob { position: absolute; top: 50%; transform: translate(-50%, -50%); width: 34px; height: 34px; border-radius: 50%; background: #fff; color: #111; display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: ew-resize; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
-#ph-compare .lbl { position: absolute; bottom: 10px; padding: 3px 9px; border-radius: 6px; background: rgba(0,0,0,.6); color: #fff; font-size: 11px; font-weight: 600; }
-#ph-compare .lbl.a { left: 10px; } #ph-compare .lbl.b { right: 10px; }
+/* ── photo zoom/pan viewer ───────────────────────────────── */
+.ph-viewer { width: min(1200px, 95vw); height: min(82vh, 920px); min-width: 460px; min-height: 340px;
+  resize: both; overflow: hidden; display: flex; flex-direction: column; padding: 0; }
+.ph-viewer .mhead { padding: 12px 16px; flex: none; }
+.zoombar { display: flex; gap: 3px; margin-left: 14px; }
+.zoombar button { background: var(--bg); border: 1px solid var(--border); color: var(--text-faint);
+  padding: 5px 11px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 7px; }
+.zoombar button:hover { color: var(--text); }
+.zoombar button.active { background: var(--accent, #7c5cff); color: #fff; border-color: transparent; }
+.ph-viewport { flex: 1; position: relative; overflow: hidden; background:
+  repeating-conic-gradient(#1a1a1e 0% 25%, #131316 0% 50%) 50% / 24px 24px; cursor: grab; }
+.ph-viewport.grabbing { cursor: grabbing; }
+#ph-img { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform;
+  image-rendering: auto; user-select: none; -webkit-user-drag: none; }
 
 /* ── benchmark results ───────────────────────────────────── */
 .bench { margin-top: 10px; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }

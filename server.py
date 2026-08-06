@@ -333,6 +333,20 @@ def create_app(state):
         return {"before": it["_before"], "after": it["_after"],
                 "dst": it["dst"], "name": it["name"]}
 
+    @app.get("/api/photos/{item_id}/image")
+    def api_photos_image(item_id: str, request: Request, which: str = Query("after"),
+                         token: str = Query(None)):
+        """Serve the FULL-resolution source/upscaled file so the zoom viewer shows
+        real pixel detail (not the small grid thumbnail)."""
+        check_token(request, token)
+        it = pq.get(item_id)
+        if not it:
+            raise HTTPException(404, "No such item")
+        path = it["dst"] if which == "after" else it["src"]
+        if not os.path.isfile(path):
+            raise HTTPException(404, "Image not found")
+        return FileResponse(path)
+
     @app.get("/api/state")
     def api_state(request: Request, token: str = Query(None)):
         check_token(request, token)

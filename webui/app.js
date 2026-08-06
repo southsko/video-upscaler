@@ -288,7 +288,11 @@ async function addPaths(paths) {
 
 /* ── model benchmark ─────────────────────────────────────── */
 async function runBenchmark() {
-  const btn = $("bench-btn"), box = $("bench-results");
+  const photos = $("view-photos").style.display !== "none";   // which tab is active
+  const btn = photos ? $("ph-bench") : $("bench-btn");
+  const box = photos ? $("ph-bench-results") : $("bench-results");
+  const modelSel = photos ? "ph-model" : "model";
+  const noteFn = photos ? updatePhModelNote : updateModelNote;
   // benchmark the practical (fast) models by default — heavy ones are labelled slow
   const models = state.models.filter((m) => !/x4plus/.test(m.name)).map((m) => m.name);
   btn.disabled = true; btn.textContent = "⏳ Benchmarking…";
@@ -307,7 +311,7 @@ async function runBenchmark() {
              <span class="bfps">${x.fps} fps</span>
            </div>`).join("");
     box.querySelectorAll(".brow[data-m]").forEach((el) => el.onclick = () => {
-      $("model").value = el.dataset.m; updateModelNote();
+      $(modelSel).value = el.dataset.m; noteFn();
     });
   } catch (e) {
     box.innerHTML = `<div class="bhead" style="color:var(--danger)">Benchmark failed: ${esc(e.message)}</div>`;
@@ -469,29 +473,86 @@ async function fetchPhPreview(id) {
   try { const p = await api("/api/photos/" + id + "/preview"); _phPrevCache[id] = p; return p; }
   catch (e) { return null; }
 }
+/* zoom/pan viewer: Fit/1×/2×/4×/8× (1× = 100% actual pixels), scroll-zoom, drag-pan,
+   before/after toggle (source is shown in the upscaled box for a same-framing compare). */
+const phView = { natW: 0, natH: 0, scale: 1, fit: 1, panX: 0, panY: 0, beforeUrl: "", afterUrl: "", src: "after" };
+function phApply() {
+  const img = $("ph-img");
+  img.style.width = phView.natW + "px"; img.style.height = phView.natH + "px";
+  img.style.transform = `translate(${phView.panX}px, ${phView.panY}px) scale(${phView.scale})`;
+  $("ph-zoomlbl").textContent = Math.round(phView.scale * 100) + "% · scroll = zoom · drag = pan";
+}
+function phFitScale() {
+  const vp = $("ph-viewport");
+  if (!phView.natW || !vp.clientWidth) return 1;
+  return Math.min(vp.clientWidth / phView.natW, vp.clientHeight / phView.natH);
+}
+function phCenter() {
+  const vp = $("ph-viewport");
+  phView.panX = (vp.clientWidth - phView.natW * phView.scale) / 2;
+  phView.panY = (vp.clientHeight - phView.natH * phView.scale) / 2;
+}
+function phSetZoom(mode) {
+  phView.fit = phFitScale();
+  phView.scale = mode === "fit" ? phView.fit : parseFloat(mode);
+  phCenter(); phApply();
+  document.querySelectorAll("#ph-zoombar button").forEach((b) => b.classList.toggle("active", b.dataset.z === mode));
+}
 async function openPhCompare(id) {
-  const p = await fetchPhPreview(id); if (!p) return;
-  $("ph-modal-title").textContent = p.name;
-  $("ph-img-before").src = p.before; $("ph-img-after").src = p.after;
-  ["ph-img-before", "ph-after-wrap", "ph-divider", "ph-knob", "ph-lbl-b", "ph-lbl-a"].forEach((i) => $(i).style.display = "");
-  setPhCompare(50);
+  const it = state.photos.find((x) => x.id === id);
+  $("ph-modal-title").textContent = it ? it.name : id;
+  const tk = TOKEN ? "&token=" + encodeURIComponent(TOKEN) : "";
+  phView.afterUrl = `/api/photos/${id}/image?which=after${tk}`;
+  phView.beforeUrl = `/api/photos/${id}/image?which=before${tk}`;
+  phView.src = "after";
+  $("ph-view-toggle").textContent = "Showing: Upscaled";
+  const img = $("ph-img");
+  img.onload = () => {                         // size from the full-res UPSCALED image
+    img.onload = null;
+    phView.natW = img.naturalWidth; phView.natH = img.naturalHeight;
+    phSetZoom("fit");
+  };
+  img.src = phView.afterUrl;                   // full file, not the thumbnail
   $("ph-overlay").classList.add("show"); $("ph-modal").classList.add("show");
 }
 function closePhCompare() { $("ph-overlay").classList.remove("show"); $("ph-modal").classList.remove("show"); }
-function setPhCompare(pct) {
-  pct = Math.max(0, Math.min(100, pct));
-  $("ph-after-wrap").style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
-  $("ph-divider").style.left = pct + "%"; $("ph-knob").style.left = pct + "%";
+function phToggleSrc() {                        // swap src, keep zoom/pan + the upscaled box
+  phView.src = phView.src === "after" ? "before" : "after";
+  $("ph-img").src = phView.src === "after" ? phView.afterUrl : phView.beforeUrl;
+  $("ph-view-toggle").textContent = "Showing: " + (phView.src === "after" ? "Upscaled" : "Source");
 }
-(function phDrag() {
-  let drag = false;
-  const cmp = () => $("ph-compare");
-  const move = (x) => { const r = cmp().getBoundingClientRect(); setPhCompare(((x - r.left) / r.width) * 100); };
+(function phPanZoom() {
+  const shown = () => $("ph-modal").classList.contains("show");
+  const vp = () => $("ph-viewport");
+  let drag = false, sx = 0, sy = 0, px = 0, py = 0;
   document.addEventListener("mousedown", (e) => {
-    if ($("ph-modal").classList.contains("show") && cmp().contains(e.target)) { drag = true; move(e.clientX); }
+    if (shown() && vp().contains(e.target)) {
+      drag = true; sx = e.clientX; sy = e.clientY; px = phView.panX; py = phView.panY;
+      vp().classList.add("grabbing"); e.preventDefault();
+    }
   });
-  document.addEventListener("mousemove", (e) => { if (drag) move(e.clientX); });
-  document.addEventListener("mouseup", () => { drag = false; });
+  document.addEventListener("mousemove", (e) => {
+    if (drag) { phView.panX = px + (e.clientX - sx); phView.panY = py + (e.clientY - sy); phApply(); }
+  });
+  document.addEventListener("mouseup", () => { drag = false; const v = vp(); if (v) v.classList.remove("grabbing"); });
+  document.addEventListener("wheel", (e) => {
+    if (!shown() || !vp().contains(e.target)) return;
+    e.preventDefault();
+    const r = vp().getBoundingClientRect(), cx = e.clientX - r.left, cy = e.clientY - r.top;
+    const ns = Math.max(phView.fit * 0.5, Math.min(16, phView.scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    phView.panX = cx - (cx - phView.panX) * (ns / phView.scale);
+    phView.panY = cy - (cy - phView.panY) * (ns / phView.scale);
+    phView.scale = ns; phApply();
+    document.querySelectorAll("#ph-zoombar button").forEach((b) => b.classList.remove("active"));
+  }, { passive: false });
+  // recompute fit when the resizable modal changes size
+  if (window.ResizeObserver) new ResizeObserver(() => {
+    if (!shown() || !phView.natW) return;
+    const wasFit = Math.abs(phView.scale - phView.fit) < 1e-4;
+    phView.fit = phFitScale();
+    if (wasFit) { phView.scale = phView.fit; phCenter(); }
+    phApply();
+  }).observe(document.getElementById("ph-viewport"));
 })();
 
 /* ── wire up ─────────────────────────────────────────────── */
@@ -523,6 +584,8 @@ function wire() {
   $("ph-bench").onclick = runBenchmark;
   $("ph-modal-close").onclick = closePhCompare;
   $("ph-overlay").onclick = closePhCompare;
+  document.querySelectorAll("#ph-zoombar button").forEach((b) => b.onclick = () => phSetZoom(b.dataset.z));
+  $("ph-view-toggle").onclick = phToggleSrc;
   $("preview-btn").onclick = runPreview;
   $("model").onchange = updateModelNote;
   $("bench-btn").onclick = runBenchmark;
